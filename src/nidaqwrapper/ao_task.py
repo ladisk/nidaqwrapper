@@ -97,6 +97,10 @@ class AOTask(BaseTask):
 
         self.sample_mode = constants.AcquisitionType.CONTINUOUS
 
+        # External sample clock terminal (introspection only — the live
+        # nidaqmx task remains the source of truth). Set by configure().
+        self.clock_source: str | None = None
+
         # Discover connected devices
         system = nidaqmx.system.System.local()
         self.device_list: list[str] = [dev.name for dev in system.devices]
@@ -192,7 +196,7 @@ class AOTask(BaseTask):
 
     # -- Task lifecycle -------------------------------------------------------
 
-    def configure(self) -> None:
+    def configure(self, *, clock_source: str | None = None) -> None:
         """Configure sample-clock timing for continuous output generation.
 
         Sets up the sample-clock timing on the nidaqmx task, enables
@@ -200,34 +204,64 @@ class AOTask(BaseTask):
         requested sample rate.  Call :meth:`start` afterwards to begin
         generation.
 
+        Parameters
+        ----------
+        clock_source : str, optional
+            Terminal name of an external sample clock (e.g.
+            ``'/Dev1/ai/SampleClock'``).  ``None`` (default) uses the
+            onboard clock.  When set, the rate-coercion check is skipped —
+            the reported rate is whatever the external clock provides, so
+            *sample_rate* must match the master task's rate (it sizes
+            buffers and timeouts).
+
         Raises
         ------
         ValueError
-            If no channels have been added, or if the hardware driver
-            coerces the sample rate to a different value than requested
-            (some devices only support discrete rates).
+            If no channels have been added; if *clock_source* is not a
+            non-empty string; or if the hardware driver coerces the
+            sample rate while using the onboard clock (some devices only
+            support discrete rates).
         RuntimeError
             If this task wraps an externally-provided nidaqmx.Task
             (created via :meth:`from_task`).
         """
         self._check_start_preconditions()
 
-        self.task.timing.cfg_samp_clk_timing(
-            rate=self.sample_rate,
-            sample_mode=constants.AcquisitionType.CONTINUOUS,
-            samps_per_chan=self.samples_per_channel,
-        )
+        if clock_source is not None and (
+            not isinstance(clock_source, str) or not clock_source
+        ):
+            raise ValueError(
+                f"clock_source must be a non-empty terminal name string "
+                f"(e.g. '/Dev1/ai/SampleClock') or None, got {clock_source!r}."
+            )
+
+        timing_kwargs: dict[str, Any] = {
+            "rate": self.sample_rate,
+            "sample_mode": constants.AcquisitionType.CONTINUOUS,
+            "samps_per_chan": self.samples_per_channel,
+        }
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
+
+        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
         self.task._out_stream.regen_mode = constants.RegenerationMode.ALLOW_REGENERATION
 
-        actual_rate = float(self.task.timing.samp_clk_rate)
-        requested_rate = float(self.sample_rate)
-        if actual_rate != requested_rate:
-            raise ValueError(
-                f"Sample rate {requested_rate} Hz is not supported by this "
-                f"device. The driver coerced it to {actual_rate} Hz. "
-                "Use a rate that the device supports."
-            )
+        # Store for introspection — the live task remains the source of truth
+        self.clock_source = clock_source
+
+        # Rate-coercion check applies only to the onboard clock: with an
+        # external clock_source the reported rate is whatever the exported
+        # clock provides (validating it is the master task's job).
+        if clock_source is None:
+            actual_rate = float(self.task.timing.samp_clk_rate)
+            requested_rate = float(self.sample_rate)
+            if actual_rate != requested_rate:
+                raise ValueError(
+                    f"Sample rate {requested_rate} Hz is not supported by this "
+                    f"device. The driver coerced it to {actual_rate} Hz. "
+                    "Use a rate that the device supports."
+                )
 
     # -- Signal generation ---------------------------------------------------
 
@@ -498,6 +532,18 @@ class AOTask(BaseTask):
         instance.sample_rate = task.timing.samp_clk_rate
         instance.samples_per_channel = task.timing.samp_quant_samp_per_chan
         instance.sample_mode = task.timing.samp_quant_samp_mode
+
+        # External clock terminal — derived from the live task; failures
+        # fall back to the safe default (None) with a warning.
+        instance.clock_source = None
+        try:
+            clk_src = task.timing.samp_clk_src
+            instance.clock_source = clk_src if clk_src else None
+        except Exception as exc:
+            warnings.warn(
+                f"Could not read sample clock source from task: {exc}",
+                stacklevel=2,
+            )
 
         # Derive device info from the task itself
         instance.device_list = [dev.name for dev in task.devices]

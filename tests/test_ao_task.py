@@ -1923,3 +1923,124 @@ class TestAOSetStartTrigger:
                 task.set_start_trigger("/Dev1/PFI0")
 
         external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+# ===========================================================================
+# task-sync-configuration: configure(clock_source=...)
+# ===========================================================================
+
+class TestConfigureClockSource:
+    """configure() accepts a keyword-only external clock_source."""
+
+    def _add_channel(self, task):
+        task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+    def test_clock_source_passed_as_source(self, mock_system, mock_constants):
+        """A non-empty clock_source is forwarded as source= to cfg_samp_clk_timing."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["source"] == "/Dev1/ai/SampleClock"
+        # Output stays continuous with the regular buffer size
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == task.samples_per_channel
+
+    def test_default_call_shape_unchanged(self, mock_system, mock_constants):
+        """configure() with defaults omits the source kwarg entirely."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure()
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+
+    def test_external_clock_skips_rate_coercion_check(self, mock_system, mock_constants):
+        """With clock_source set, a differing reported rate does NOT raise."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=9000)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")  # no raise
+
+    def test_internal_clock_keeps_rate_coercion_check(self, mock_system, mock_constants):
+        """Without clock_source the rate-coercion ValueError stays active."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=9000)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="rate"):
+                task.configure()
+
+    @pytest.mark.parametrize("bad_source", ["", 42, ["/Dev1/PFI0"]])
+    def test_invalid_clock_source_raises(self, mock_system, mock_constants,
+                                         bad_source):
+        """clock_source must be a non-empty string (or None)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="clock_source"):
+                task.configure(clock_source=bad_source)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_explicit_none_clock_source_same_as_default(self, mock_system,
+                                                        mock_constants):
+        """configure(clock_source=None) omits source= exactly like configure()."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source=None)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert task.clock_source is None
+
+    def test_not_owned_configure_raises(self, mock_system, mock_constants):
+        """configure(clock_source=...) keeps the ownership gate (RuntimeError)."""
+        external = _make_external_ao_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        external.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_regeneration_still_enabled_with_clock_source(self, mock_system,
+                                                          mock_constants):
+        """Buffer regeneration is enabled also with an external clock source
+        (the onboard-clock path is covered by the existing TestConfigure)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert (mt._out_stream.regen_mode
+                is mock_constants.RegenerationMode.ALLOW_REGENERATION)
+
+    def test_stores_clock_source_attribute(self, mock_system, mock_constants):
+        """configure() stores self.clock_source for introspection."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source == "/Dev1/ai/SampleClock"
+
+    def test_clock_source_attribute_default(self, mock_system, mock_constants):
+        """clock_source defaults to None at construction and after configure()."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            assert task.clock_source is None
+            self._add_channel(task)
+            task.configure()
+
+        assert task.clock_source is None
