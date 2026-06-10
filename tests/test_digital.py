@@ -3117,3 +3117,225 @@ class TestDOTaskSetStartTrigger:
                 do.set_start_trigger("/cDAQ1/PFI0")
 
         external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+# ===========================================================================
+# task-sync-configuration: DITask.configure() sync extensions
+# ===========================================================================
+
+class TestDITaskConfigureSync:
+    """DITask.configure(sample_mode=, samples_per_channel=, clock_source=)."""
+
+    def test_finite_clocked_all_kwargs(self, mock_system, mock_constants):
+        """Finite clocked DI: FINITE mode, samps_per_chan and source forwarded."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="finite", samples_per_channel=500,
+                         clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 1000
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.FINITE
+        assert kwargs["samps_per_chan"] == 500
+        assert kwargs["source"] == "/cDAQ1Mod1/ai/SampleClock"
+        assert di.samples_per_channel == 500
+
+    def test_finite_without_samples_per_channel_raises(self, mock_system,
+                                                       mock_constants):
+        """Finite mode without samples_per_channel raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                di.configure(sample_mode="finite")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_invalid_sample_mode_raises(self, mock_system, mock_constants):
+        """An unknown sample_mode string raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="sample_mode"):
+                di.configure(sample_mode="burst")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    # True is included deliberately: isinstance(True, int) holds in Python,
+    # so bools must be rejected explicitly by the implementation.  None is
+    # included because finite mode requires an explicit positive count.
+    @pytest.mark.parametrize("bad_count", [0, -5, 2.5, "100", True, None])
+    def test_invalid_samples_per_channel_raises(self, mock_system, mock_constants,
+                                                bad_count):
+        """samples_per_channel must be a positive int (bool excluded)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                di.configure(sample_mode="finite", samples_per_channel=bad_count)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    @pytest.mark.parametrize("bad_source", ["", 42, ["/Dev1/PFI0"]])
+    def test_invalid_clock_source_raises(self, mock_system, mock_constants,
+                                         bad_source):
+        """clock_source must be a non-empty string (or None)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="clock_source"):
+                di.configure(clock_source=bad_source)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    @pytest.mark.parametrize("sync_kwargs", [
+        {"sample_mode": "finite", "samples_per_channel": 10},
+        {"samples_per_channel": 10},
+        {"clock_source": "/cDAQ1Mod1/ai/SampleClock"},
+        {"sample_mode": "finite"},
+    ])
+    def test_on_demand_sync_kwargs_raise(self, mock_system, mock_constants,
+                                         sync_kwargs):
+        """Any sync parameter in on-demand mode raises RuntimeError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(RuntimeError, match="clocked"):
+                di.configure(**sync_kwargs)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_on_demand_plain_configure_still_noop(self, mock_system, mock_constants):
+        """configure() without arguments stays a no-op in on-demand mode."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure()  # no raise
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_default_clocked_call_shape_unchanged(self, mock_system, mock_constants):
+        """Clocked configure() with defaults omits source and samps_per_chan."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure()
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert "samps_per_chan" not in kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+
+    def test_clock_source_none_omits_source_kwarg(self, mock_system, mock_constants):
+        """Explicit clock_source=None omits source= exactly like the default."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(clock_source=None)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert di.clock_source is None
+
+    def test_continuous_with_samples_per_channel_allowed(self, mock_system,
+                                                         mock_constants):
+        """samples_per_channel with 'continuous' is a buffer-size hint (allowed)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="continuous", samples_per_channel=2000)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == 2000
+
+    def test_stores_introspection_attributes(self, mock_system, mock_constants):
+        """configure() stores sample_mode_str, samples_per_channel, clock_source."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="finite", samples_per_channel=500,
+                         clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        assert di.sample_mode_str == "finite"
+        assert di.samples_per_channel == 500
+        assert di.clock_source == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_attributes_initialized_at_construction(self, mock_system,
+                                                    mock_constants):
+        """New attributes exist with defaults before configure() is called."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            assert di.sample_mode_str == "continuous"
+            assert di.samples_per_channel is None
+            assert di.clock_source is None
+
+    def test_not_owned_configure_raises(self, mock_system, mock_constants):
+        """configure(sync kwargs) keeps the ownership gate (RuntimeError)."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                di.configure(sample_mode="finite", samples_per_channel=10)
+
+        external.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_dotask_configure_signature_unchanged(self, mock_system, mock_constants):
+        """DOTask.configure() does not accept the sync keywords (out of scope)."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.add_channel("lines", lines="Dev1/port1/line0:3")
+            with pytest.raises(TypeError):
+                do.configure(sample_mode="finite", samples_per_channel=10)
+
+
+# ===========================================================================
+# task-sync-configuration: finite blocking-read contract for DITask.acquire()
+# ===========================================================================
+
+class TestDITaskFiniteAcquireContract:
+    """acquire() on a finite DI task reads with READ_ALL_AVAILABLE (-1), which
+    in nidaqmx blocks until the finite acquisition completes."""
+
+    def test_finite_acquire_reads_all_available(self, mock_system, mock_constants):
+        """After finite configure, acquire() calls read(-1) and returns
+        (n_samples, n_lines)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:1")
+            di.configure(sample_mode="finite", samples_per_channel=4)
+
+            # nidaqmx returns (n_lines, n_samples) — full finite acquisition.
+            # Blocking until completion is nidaqmx driver behavior for finite
+            # tasks; the wrapper just passes -1 (READ_ALL_AVAILABLE).
+            mt.read.return_value = [
+                [True, False, True, False],
+                [False, True, False, True],
+            ]
+
+            result = di.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 2)
+        # Pin the transpose: columns are lines, rows are samples
+        np.testing.assert_array_equal(result[:, 0], [True, False, True, False])
+        np.testing.assert_array_equal(result[:, 1], [False, True, False, True])
+
+    def test_finite_acquire_single_line(self, mock_system, mock_constants):
+        """Finite single-line acquisition returns (n_samples, 1)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("line", lines="Dev1/port0/line0")
+            di.configure(sample_mode="finite", samples_per_channel=4)
+
+            mt.read.return_value = [True, False, True, False]
+
+            result = di.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 1)
