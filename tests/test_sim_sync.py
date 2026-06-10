@@ -296,6 +296,10 @@ class TestAOSlaveClockProbe:
                 max_val=10.0,
             )
 
+            # Only the route itself may be rejected — keep the DaqError
+            # net narrow (configure + the auto-starting generate, where
+            # route reservation can also surface). stop() stays outside:
+            # a failure there would be a genuine bug, not a rejected route.
             try:
                 ao.configure(
                     clock_source=f"/{simulated_device_name}/ai/SampleClock"
@@ -303,14 +307,15 @@ class TestAOSlaveClockProbe:
                 t = np.arange(1000) / rate
                 signal = 2.0 * np.sin(2 * np.pi * 100 * t)
                 ao.generate(signal)  # auto-starts on the slaved clock
-                time.sleep(0.2)
-                ao.task.stop()
             except DaqError as exc:
                 pytest.skip(
                     "AO slaving to "
                     f"/{simulated_device_name}/ai/SampleClock rejected on "
                     f"simulated PCIe-6361: {exc}"
                 )
+
+            time.sleep(0.2)
+            ao.task.stop()
         finally:
             ao.clear_task()
             ai.clear_task()
