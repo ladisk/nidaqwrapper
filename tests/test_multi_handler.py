@@ -20,6 +20,7 @@ Covers all 16 task groups from the OpenSpec change:
 from __future__ import annotations
 
 import threading
+import warnings
 from unittest.mock import MagicMock, patch, PropertyMock, call
 
 import numpy as np
@@ -568,33 +569,79 @@ class TestValidateSampleRates:
 
 
 class TestValidateTiming:
-    """Task group 7 — _validate_timing()."""
+    """Task group 7 — _validate_timing().
 
-    def test_matching_timing_returns_true(self, adv):
-        """7.1 Matching clock_source, clock_rate, samples_per_channel returns True."""
+    FR-5.5 (relaxed by sync-validation-simulated-coverage): rate and
+    samples-per-channel mismatches fail; clock-source readback mismatches
+    warn and pass (readback strings are not canonical — a master reads back
+    its timebase terminal, a slave the exported sample-clock terminal).
+    """
+
+    def test_matching_timing_returns_true_without_warning(self, adv):
+        """7.1 Matching clock_source, clock_rate, samples_per_channel returns True, no warning."""
         t1 = _make_nidaqmx_task(samp_clk_src="OnboardClock", samp_clk_rate=25600, samp_quant_samp_per_chan=25600)
         t2 = _make_nidaqmx_task(samp_clk_src="OnboardClock", samp_clk_rate=25600, samp_quant_samp_per_chan=25600)
-        assert adv._validate_timing([t1, t2]) is True
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert adv._validate_timing([t1, t2]) is True
 
-    def test_mismatching_clock_source_returns_false(self, adv):
-        """7.2 Mismatching clock_source returns False."""
-        t1 = _make_nidaqmx_task(samp_clk_src="OnboardClock")
-        t2 = _make_nidaqmx_task(samp_clk_src="/cDAQ1/PFI0")
+    def test_mismatching_clock_source_warns_and_passes(self, adv):
+        """7.2 Mismatching samp_clk_src readbacks emit UserWarning naming
+        each task and its source, and return True (master/slave pattern)."""
+        t1 = _make_nidaqmx_task(
+            name="MasterAI",
+            samp_clk_src="/SimDev1/ai/SampleClockTimebase",
+            samp_clk_rate=25600,
+            samp_quant_samp_per_chan=25600,
+        )
+        t2 = _make_nidaqmx_task(
+            name="SlaveDI",
+            samp_clk_src="/SimDev1/ai/SampleClock",
+            samp_clk_rate=25600,
+            samp_quant_samp_per_chan=25600,
+        )
+        with pytest.warns(UserWarning) as record:
+            assert adv._validate_timing([t1, t2]) is True
+        assert len(record) == 1, "exactly one warning expected"
+        msg = str(record[0].message)
+        # repr-delimited pairs: the closing quote makes the assertion exact
+        # ('/SimDev1/ai/SampleClock' is otherwise a substring of
+        # '/SimDev1/ai/SampleClockTimebase')
+        assert "'MasterAI': '/SimDev1/ai/SampleClockTimebase'" in msg
+        assert "'SlaveDI': '/SimDev1/ai/SampleClock'" in msg
+
+    def test_mismatching_source_and_rate_returns_false(self, adv):
+        """7.2b Source mismatch combined with rate mismatch still hard-fails:
+        the relaxation must not let a warning short-circuit the rate check."""
+        t1 = _make_nidaqmx_task(
+            samp_clk_src="/SimDev1/ai/SampleClockTimebase", samp_clk_rate=25600.0
+        )
+        t2 = _make_nidaqmx_task(
+            samp_clk_src="/SimDev2/ai/SampleClock", samp_clk_rate=51200.0
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            assert adv._validate_timing([t1, t2]) is False
+
+    def test_mismatching_rate_returns_false(self, adv):
+        """7.3 Mismatching samp_clk_rate returns False (hard failure, no pass)."""
+        t1 = _make_nidaqmx_task(samp_clk_rate=25600.0)
+        t2 = _make_nidaqmx_task(samp_clk_rate=51200.0)
         assert adv._validate_timing([t1, t2]) is False
 
     def test_mismatching_samples_per_channel_returns_false(self, adv):
-        """7.3 Mismatching samples_per_channel returns False."""
+        """7.4 Mismatching samples_per_channel returns False (hard failure)."""
         t1 = _make_nidaqmx_task(samp_quant_samp_per_chan=25600)
         t2 = _make_nidaqmx_task(samp_quant_samp_per_chan=51200)
         assert adv._validate_timing([t1, t2]) is False
 
     def test_single_task_returns_true(self, adv):
-        """7.4 Single task returns True."""
+        """7.5 Single task returns True."""
         t1 = _make_nidaqmx_task()
         assert adv._validate_timing([t1]) is True
 
     def test_empty_list_returns_true(self, adv):
-        """7.5 Empty list returns True."""
+        """7.6 Empty list returns True."""
         assert adv._validate_timing([]) is True
 
 

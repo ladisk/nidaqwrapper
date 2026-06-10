@@ -992,10 +992,18 @@ class MultiHandler:
         return True
 
     def _validate_timing(self, tasks: list) -> bool:
-        """Verify all tasks share identical clock source and timing settings.
+        """Verify all tasks share compatible timing settings (FR-5.5, relaxed).
 
-        Compares the frozenset of ``{clock_source, clock_rate,
-        samples_per_channel}`` dicts across tasks.
+        Sample-clock rate and samples-per-channel must be equal across all
+        tasks — mismatches there corrupt synchronized data and fail
+        validation.  Sample-clock *source* readback strings are **not**
+        required to match: readbacks are not canonical (a master task on the
+        onboard clock reads back its timebase terminal, e.g.
+        ``/Dev1/ai/SampleClockTimebase``, while a slave configured with the
+        exported terminal reads back ``/Dev1/ai/SampleClock``), so string
+        equality rejects exactly the master/slave and cross-device
+        configurations this handler exists to support.  Differing sources
+        emit a single :class:`UserWarning` listing each task's readback.
 
         Parameters
         ----------
@@ -1005,23 +1013,33 @@ class MultiHandler:
         Returns
         -------
         bool
-            ``True`` when all tasks have identical timing configuration, or
-            when fewer than two tasks are present.
+            ``True`` when rates and samples-per-channel are equal (clock
+            sources may differ — see warning), or when fewer than two tasks
+            are present.  ``False`` when rates or samples-per-channel
+            differ.
         """
         if len(tasks) <= 1:
             return True
 
-        configs: set = set()
-        for task in tasks:
-            cfg = {
-                "clock_source": task.timing.samp_clk_src,
-                "clock_rate": task.timing.samp_clk_rate,
-                "samples_per_channel": task.timing.samp_quant_samp_per_chan,
-            }
-            configs.add(frozenset(cfg.items()))
-
-        if len(configs) > 1:
+        rates = {task.timing.samp_clk_rate for task in tasks}
+        samples = {task.timing.samp_quant_samp_per_chan for task in tasks}
+        if len(rates) > 1 or len(samples) > 1:
             return False
+
+        sources = [task.timing.samp_clk_src for task in tasks]
+        if len(set(sources)) > 1:
+            detail = ", ".join(
+                f"{task.name!r}: {source!r}"
+                for task, source in zip(tasks, sources)
+            )
+            warnings.warn(
+                f"Tasks report different sample-clock sources ({detail}). "
+                "Verify the clock wiring — identical-source validation is "
+                "not possible from readback strings (a master reads back "
+                "its timebase terminal, a slave the exported sample-clock "
+                "terminal).",
+                stacklevel=2,
+            )
 
         return True
 
