@@ -207,9 +207,11 @@ adv.disconnect()
 `stop_acquisition()` aborts a software-triggered acquisition whose trigger never
 fires; `is_running()` and `check_state()` support watchdog-style health polling.
 
-> Note: MultiHandler validates that all tasks share identical clock-source strings —
-> configure the master's `clock_source` explicitly (as above) rather than leaving it
-> on the implicit onboard clock.
+> Note: tasks reporting different clock-source readbacks (a master on the onboard
+> clock reads back its timebase terminal, a slave the exported sample-clock terminal)
+> produce a `UserWarning` from `MultiHandler.configure()` instead of failing
+> validation — verify the clock wiring matches the warning. Mismatched sample rates
+> or samples-per-channel still fail validation.
 
 ### Context manager (automatic cleanup)
 

@@ -6,8 +6,8 @@ nidaqwrapper uses a three-tier test strategy to balance speed, coverage, and har
 
 | Tier | Tests | Requirements | Purpose |
 |------|-------|-------------|---------|
-| **Mocked** | 663 | None | Fast unit tests with mocked nidaqmx for CI/CD |
-| **Simulated** | 59 + 1 xfail | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
+| **Mocked** | 858 | None | Fast unit tests with mocked nidaqmx for CI/CD |
+| **Simulated** | 77 + 1 xfail (+1 env-dependent skip) | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
 | **Hardware** | 32 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
 
 The simulated tier bridges the gap between mocked tests and hardware tests. All 4 bugs found during hardware testing were invisible to mocked tests because `MagicMock` auto-generates any attribute on access, masking real API mismatches. Simulated devices use the real NI-DAQmx driver with simulated hardware, catching API contract violations while remaining fast and deterministic.
@@ -35,7 +35,7 @@ The default `uv run pytest` excludes both simulated and hardware tests to ensure
 
 ## Test Tiers
 
-### Mocked Tests (663 tests)
+### Mocked Tests (858 tests)
 
 **What they test:**
 - Public API contracts (function signatures, return types)
@@ -64,6 +64,10 @@ The default `uv run pytest` excludes both simulated and hardware tests to ensure
 - Task lifecycle (create, configure, start, read/write, stop, clear)
 - TOML config with real device names
 - Raw task pass-through pattern (`from_task()`)
+- Synchronized acquisition: finite mode, digital/analog edge start
+  triggers, master/slave sample-clock routing, the MultiHandler
+  synchronized burst with trigger hooks, and acquisition abort
+  (`tests/test_sim_sync.py`, `tests/test_sim_multi.py`)
 
 **What they catch that mocks miss:**
 The following bugs were found only during hardware testing because mocks could not detect them:
@@ -83,7 +87,12 @@ Simulated tests detect these issues without requiring physical hardware.
 **Limitations:**
 - AI channels return synthetic sine + noise, not real sensor data
 - Counter inputs always return 0 (documented NI-DAQmx limitation)
-- Triggers fire immediately (no real timing constraints)
+- Triggers fire immediately (no real timing constraints) — triggered
+  tests assert completion with the trigger configured, not waiting
+- Analog edge triggers are accepted only via the `APFI0` terminal
+- Cross-device trigger routing (e.g. `/SimDev1/PFI0` to SimDev2) needs a
+  registered RTSI cable and is rejected for simulated PCIe devices
+  (DaqError -89125) — full cross-device bursts are hardware-test only
 - cDAQ chassis/modules cannot be simulated on Linux
 
 ### Hardware Tests (32 tests)
@@ -296,6 +305,7 @@ Location: `tests/test_sim_<topic>.py`
 
 Use the `@pytest.mark.simulated` decorator and fixtures from `tests/conftest.py`:
 - `simulated_device_name` — returns `"SimDev1"` or skips test if not available
+- `sim_device2_name` — returns `"SimDev2"` (cross-device tests) or skips
 - `sim_device` — returns the `nidaqmx.system.device.Device` object
 - `simulated_task_name` — returns `"SimTask1"` or skips if not available
 
