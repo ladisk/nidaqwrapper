@@ -52,7 +52,9 @@ wrapper.disconnect()
 - **Analog output** (`AOTask`) -- voltage generation with continuous buffer regeneration
 - **Digital I/O** (`DITask` / `DOTask`) -- on-demand single-sample and clocked continuous modes
 - **Single-task handler** (`DAQHandler`) -- configure, connect, acquire/generate, disconnect lifecycle with software triggering via pyTrigger
-- **Multi-task synchronization** (`MultiHandler`) -- hardware-triggered finite acquisition and validated multi-task pipelines
+- **Multi-task synchronization** (`MultiHandler`) -- hardware-triggered finite acquisition and validated multi-task pipelines, with trigger-firing hooks and non-blocking acquisition
+- **Synchronized timing** -- finite/continuous acquisition modes, shared sample clocks (`clock_source`), and digital/analog edge start triggers (`set_start_trigger()`, `set_analog_start_trigger()`) on all task classes
+- **Acquisition control** -- `stop_acquisition()` cooperative abort, `is_running()`, `check_state()` auto-reconnection on both handlers
 - **TOML configuration** -- `save_config()` / `from_config()` for portable, human-readable task definitions with device aliases
 - **Device discovery** -- `list_devices()`, `list_tasks()`, `get_connected_devices()` for hardware enumeration
 - **Raw task injection** -- `from_task()` on all task classes wraps pre-configured `nidaqmx.Task` objects
@@ -166,6 +168,49 @@ data = adv.acquire()
 adv.disconnect()
 ```
 
+### Hardware-triggered synchronized burst (no raw nidaqmx needed)
+
+Build finite tasks sharing one sample clock and one start trigger entirely with
+nidaqwrapper, then acquire them as a synchronized burst:
+
+```python
+from nidaqwrapper import AITask, DITask, MultiHandler
+
+# Master analog task: finite acquisition, onboard clock
+ai = AITask('vibration', sample_rate=25600)
+ai.add_channel('acc0', device='cDAQ1Mod1', channel_ind=0,
+               sensitivity=100.0, sensitivity_units='mV/g', units='g')
+ai.configure(sample_mode='finite', samples_per_channel=25600,
+             clock_source='/cDAQ1Mod1/ai/SampleClock')
+ai.set_start_trigger('/cDAQ1/PFI0', edge='rising')
+
+# Slave digital task: same clock, same trigger
+di = DITask('flags', sample_rate=25600)
+di.add_channel('gate', lines='cDAQ1Mod2/port0/line0')
+di.configure(sample_mode='finite', samples_per_channel=25600,
+             clock_source='/cDAQ1Mod1/ai/SampleClock')
+di.set_start_trigger('/cDAQ1/PFI0', edge='rising')
+
+adv = MultiHandler()
+adv.configure(input_tasks=[ai.task, di.task])
+adv.connect()
+
+# Optional: hooks that select a bench procedure and fire the physical trigger
+adv.set_hardware_trigger_functions(start_function=fire_pfi_line,
+                                   support_function=select_procedure)
+
+future = adv.acquire(custom_mode='run_up', blocking=False)  # arms tasks, fires trigger
+data = future.result()   # {task_name: {channel_name: samples}}
+adv.disconnect()
+```
+
+`stop_acquisition()` aborts a software-triggered acquisition whose trigger never
+fires; `is_running()` and `check_state()` support watchdog-style health polling.
+
+> Note: MultiHandler validates that all tasks share identical clock-source strings —
+> configure the master's `clock_source` explicitly (as above) rather than leaving it
+> on the implicit onboard clock.
+
 ### Context manager (automatic cleanup)
 
 ```python
@@ -210,8 +255,8 @@ raw_task.close()  # Caller retains ownership
 
 | Class | Module | Purpose |
 |-------|--------|---------|
-| `DAQHandler` | `handler` | Single-task handler with software triggering, auto-reconnection |
-| `MultiHandler` | `multi_handler` | Multi-task orchestrator with hardware trigger validation |
+| `DAQHandler` | `handler` | Single-task handler with software triggering, auto-reconnection, acquisition abort |
+| `MultiHandler` | `multi_handler` | Multi-task orchestrator with hardware trigger validation, trigger hooks, non-blocking acquire, health checks |
 
 ### Utility Functions
 
