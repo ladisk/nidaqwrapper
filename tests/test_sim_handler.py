@@ -564,3 +564,76 @@ class TestHandlerNonBlockingAcquire:
 
         finally:
             handler.disconnect()
+
+
+# ===========================================================================
+# Task Group 3 (sync-validation-simulated-coverage): acquisition abort
+# ===========================================================================
+
+
+class TestHandlerStopAcquisition:
+    """Validate stop_acquisition() abort and is_running() on SimDev1."""
+
+    def test_stop_acquisition_aborts_unreachable_trigger(
+        self, sim_device_name: str
+    ) -> None:
+        """Abort an acquisition whose trigger level (99 V) can never fire.
+
+        Verifies:
+        - is_running() turns True once the acquisition loop starts
+        - stop_acquisition() makes the Future resolve within a bounded
+          timeout (non-daemon worker thread — a hang here hangs pytest)
+        - the aborted acquisition returns the ring-buffer contents
+        - the input task is stopped afterwards (is_running() False)
+        """
+        pytest.importorskip("pyTrigger", reason="pyTrigger not installed")
+
+        from nidaqwrapper import AITask, DAQHandler
+
+        n_samples = 10000
+        task = AITask("test_handler_abort", sample_rate=10000)
+        task.add_channel("ai0", device=sim_device_name, channel_ind=0, units="V")
+
+        handler = DAQHandler()
+        try:
+            handler.configure(task_in=task)
+            handler.connect()
+
+            # 99 V is unreachable on a +-10 V simulated signal — the
+            # trigger never fires and the loop polls until aborted.
+            handler.set_trigger(
+                n_samples=n_samples,
+                trigger_channel=0,
+                trigger_level=99.0,
+                trigger_type="abs",
+            )
+
+            future = handler.acquire(blocking=False)
+            assert isinstance(future, Future)
+
+            # Wait (bounded) until the acquisition loop is actually running
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if handler.is_running():
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail("acquisition never started within 5 s")
+
+            handler.stop_acquisition()
+
+            data = future.result(timeout=10)
+
+            assert isinstance(data, np.ndarray), (
+                "aborted acquisition must still return ring-buffer contents"
+            )
+            assert data.shape == (n_samples, 1), (
+                f"Expected ring buffer ({n_samples}, 1), got {data.shape}"
+            )
+
+            # The aborted acquisition stops the input task
+            assert handler.is_running() is False, (
+                "input task must be stopped after the aborted acquisition"
+            )
+        finally:
+            handler.disconnect()

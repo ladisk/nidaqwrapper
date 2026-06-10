@@ -421,3 +421,35 @@ def sim_device_name(simulated_device_name):
         Device name string (e.g. "SimDev1") for use in add_channel(device=...).
     """
     return simulated_device_name
+
+
+SIMULATED_DEVICE2_NAME = "SimDev2"
+
+
+@pytest.fixture(scope="session")
+def sim_device2_name():
+    """Provide the second simulated device name (cross-device tests).
+
+    Returns
+    -------
+    str
+        The second simulated device name (e.g. "SimDev2").
+
+    Raises
+    ------
+    pytest.skip
+        If the second simulated device does not exist.
+    """
+    try:
+        import nidaqmx.system
+
+        devices = [d.name for d in nidaqmx.system.System.local().devices]
+        if SIMULATED_DEVICE2_NAME not in devices:
+            pytest.skip(
+                f"Simulated device '{SIMULATED_DEVICE2_NAME}' not found. "
+                "Run 'sudo scripts/setup_simulated_devices.sh' to create it. "
+                "See TESTING.md for details."
+            )
+        return SIMULATED_DEVICE2_NAME
+    except ImportError:
+        pytest.skip("nidaqmx not installed")
