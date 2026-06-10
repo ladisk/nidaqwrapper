@@ -2568,6 +2568,12 @@ def _make_external_ai_task(mock_constants):
     mock_ni_task.ai_channels = [mock_ch]
     mock_ni_task.channel_names = ["ai0"]
     mock_ni_task.is_task_done.return_value = True
+
+    # Pitfall 11: from_task() populates device info from task.devices
+    mock_dev = MagicMock()
+    mock_dev.name = "cDAQ1Mod1"
+    mock_dev.product_type = "NI 9234"
+    mock_ni_task.devices = [mock_dev]
     return mock_ni_task
 
 
@@ -2656,3 +2662,403 @@ class TestSetStartTrigger:
             task.set_start_trigger("/Dev1/PFI0")
 
         mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once()
+
+
+# ===========================================================================
+# task-sync-configuration: configure() sync extensions
+# ===========================================================================
+
+class TestConfigureSyncExtensions:
+    """configure(sample_mode=, samples_per_channel=, clock_source=) extensions."""
+
+    def _add_channel(self, task):
+        task.add_channel(
+            "accel_x", device="cDAQ1Mod1", channel_ind=0,
+            sensitivity=100.0, sensitivity_units="mV/g", units="g",
+        )
+
+    def test_finite_mode_maps_to_enum(self, mock_system, mock_constants):
+        """sample_mode='finite' maps to AcquisitionType.FINITE with samps_per_chan."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(sample_mode="finite", samples_per_channel=1000)
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.FINITE
+        assert kwargs["samps_per_chan"] == 1000
+        assert kwargs["rate"] == 25600
+
+    def test_finite_without_samples_per_channel_raises(self, mock_system, mock_constants):
+        """sample_mode='finite' without samples_per_channel raises ValueError;
+        task timing is not changed."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                task.configure(sample_mode="finite")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_invalid_sample_mode_raises(self, mock_system, mock_constants):
+        """An unknown sample_mode string raises ValueError; timing unchanged."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="sample_mode"):
+                task.configure(sample_mode="single")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    # True is included deliberately: isinstance(True, int) holds in Python,
+    # so bools must be rejected explicitly by the implementation.
+    @pytest.mark.parametrize("bad_count", [0, -5, 2.5, "100", True])
+    def test_invalid_samples_per_channel_raises(self, mock_system, mock_constants,
+                                                bad_count):
+        """samples_per_channel must be a positive int (bool excluded)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                task.configure(sample_mode="finite", samples_per_channel=bad_count)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_clock_source_passed_as_source(self, mock_system, mock_constants):
+        """A non-empty clock_source is forwarded as source= to cfg_samp_clk_timing."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["source"] == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_default_call_shape_unchanged(self, mock_system, mock_constants):
+        """configure() with defaults omits source and samps_per_chan entirely."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure()
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert "samps_per_chan" not in kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+
+    def test_external_clock_skips_rate_coercion_check(self, mock_system, mock_constants):
+        """With clock_source set, a differing reported rate does NOT raise."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=25600, samp_clk_rate=25000)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/cDAQ1Mod1/ai/SampleClock")  # no raise
+
+    def test_internal_clock_keeps_rate_coercion_check(self, mock_system, mock_constants):
+        """Without clock_source the rate-coercion ValueError stays active."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=25600, samp_clk_rate=25000)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="rate"):
+                task.configure(sample_mode="finite", samples_per_channel=100)
+
+    def test_continuous_with_samples_per_channel_allowed(self, mock_system,
+                                                         mock_constants):
+        """samples_per_channel with 'continuous' is a buffer-size hint (allowed)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(samples_per_channel=50000)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == 50000
+
+    def test_all_parameters_compose(self, mock_system, mock_constants):
+        """All three extensions compose in a single configure() call."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(sample_mode="continuous", samples_per_channel=5000,
+                           clock_source="/Dev1/ai/SampleClock")
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == 5000
+        assert kwargs["source"] == "/Dev1/ai/SampleClock"
+
+    @pytest.mark.parametrize("bad_source", ["", 42, ["/Dev1/PFI0"]])
+    def test_invalid_clock_source_raises(self, mock_system, mock_constants,
+                                         bad_source):
+        """clock_source must be a non-empty string (or None)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="clock_source"):
+                task.configure(clock_source=bad_source)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_stores_introspection_attributes(self, mock_system, mock_constants):
+        """configure() stores sample_mode_str, samples_per_channel, clock_source."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=25600, samp_clk_rate=25000)
+        with ctx:
+            self._add_channel(task)
+            task.configure(sample_mode="finite", samples_per_channel=500,
+                           clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        assert task.sample_mode_str == "finite"
+        assert task.samples_per_channel == 500
+        assert task.clock_source == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_default_attributes_after_configure(self, mock_system, mock_constants):
+        """Plain configure() stores the default attribute values."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure()
+
+        assert task.sample_mode_str == "continuous"
+        assert task.samples_per_channel is None
+        assert task.clock_source is None
+
+    def test_attributes_initialized_at_construction(self, mock_system, mock_constants):
+        """New attributes exist with defaults before configure() is called."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            pass
+
+        assert task.sample_mode_str == "continuous"
+        assert task.samples_per_channel is None
+        assert task.clock_source is None
+
+
+# ===========================================================================
+# task-sync-configuration: set_analog_start_trigger()
+# ===========================================================================
+
+class TestSetAnalogStartTrigger:
+    """set_analog_start_trigger() configures an analog edge start trigger."""
+
+    def test_default_rising_slope_level_zero(self, mock_system, mock_constants):
+        """Defaults: slope='rising' -> Slope.RISING, level 0.0."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_analog_start_trigger("APFI0")
+
+        trig = mt.triggers.start_trigger.cfg_anlg_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "APFI0"
+        assert kwargs["trigger_slope"] is mock_constants.Slope.RISING
+        assert kwargs["trigger_level"] == 0.0
+
+    def test_falling_slope_with_level(self, mock_system, mock_constants):
+        """slope='falling' maps to Slope.FALLING; level is forwarded."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_analog_start_trigger("APFI0", slope="falling", level=2.5)
+
+        kwargs = mt.triggers.start_trigger.cfg_anlg_edge_start_trig.call_args.kwargs
+        assert kwargs["trigger_slope"] is mock_constants.Slope.FALLING
+        assert kwargs["trigger_level"] == 2.5
+
+    def test_level_coerced_to_float(self, mock_system, mock_constants):
+        """An int level is coerced to float before the driver call."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_analog_start_trigger("APFI0", level=3)
+
+        level = mt.triggers.start_trigger.cfg_anlg_edge_start_trig.call_args.kwargs[
+            "trigger_level"
+        ]
+        assert isinstance(level, float)
+        assert level == 3.0
+
+    def test_invalid_slope_raises(self, mock_system, mock_constants):
+        """A slope other than 'rising'/'falling' raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="slope"):
+                task.set_analog_start_trigger("APFI0", slope="sideways")
+
+        mt.triggers.start_trigger.cfg_anlg_edge_start_trig.assert_not_called()
+
+    @pytest.mark.parametrize("bad_source", ["", 0, None])
+    def test_invalid_source_raises(self, mock_system, mock_constants, bad_source):
+        """Empty/non-string source raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_analog_start_trigger(bad_source)
+
+        mt.triggers.start_trigger.cfg_anlg_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.set_analog_start_trigger("APFI0")
+
+        mock_ni_task.triggers.start_trigger.cfg_anlg_edge_start_trig.assert_not_called()
+
+
+# ===========================================================================
+# task-sync-configuration: finite blocking-read contract for acquire()
+# ===========================================================================
+
+class TestFiniteAcquireContract:
+    """acquire() on a finite task reads with READ_ALL_AVAILABLE (-1), which in
+    nidaqmx blocks until the finite acquisition completes — the hardware-trigger
+    synchronization mechanism."""
+
+    def test_finite_acquire_reads_all_available(self, mock_system, mock_constants):
+        """After finite configure, acquire() calls read(-1) and returns
+        (n_samples, n_channels)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel(
+                "accel_x", device="cDAQ1Mod1", channel_ind=0,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            task.add_channel(
+                "accel_y", device="cDAQ1Mod1", channel_ind=1,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            task.configure(sample_mode="finite", samples_per_channel=4)
+
+        # nidaqmx returns (n_channels, n_samples) — full finite acquisition
+        mt.read.return_value = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+        ]
+
+        result = task.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 2)
+
+    def test_finite_acquire_single_channel(self, mock_system, mock_constants):
+        """Finite single-channel acquisition returns (n_samples, 1)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel(
+                "accel_x", device="cDAQ1Mod1", channel_ind=0,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            task.configure(sample_mode="finite", samples_per_channel=4)
+
+        mt.read.return_value = [1.0, 2.0, 3.0, 4.0]
+
+        result = task.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 1)
+
+
+# ===========================================================================
+# task-sync-configuration: from_task() populates sync attributes
+# ===========================================================================
+
+class TestFromTaskSyncAttributes:
+    """from_task() derives sample_mode_str / samples_per_channel / clock_source."""
+
+    def test_finite_external_task(self, mock_system, mock_constants):
+        """A FINITE external task yields 'finite' + samples count + clock source."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        mock_ni_task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.FINITE
+        mock_ni_task.timing.samp_quant_samp_per_chan = 1000
+        mock_ni_task.timing.samp_clk_src = "/cDAQ1Mod1/ai/SampleClock"
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+        assert task.sample_mode_str == "finite"
+        assert task.samples_per_channel == 1000
+        assert task.clock_source == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_continuous_external_task(self, mock_system, mock_constants):
+        """A CONTINUOUS external task yields 'continuous' and no samples count."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        mock_ni_task.timing.samp_clk_src = "OnboardClock"
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+        assert task.sample_mode_str == "continuous"
+        assert task.samples_per_channel is None
+        assert task.clock_source == "OnboardClock"
+
+    def test_empty_clock_source_maps_to_none(self, mock_system, mock_constants):
+        """An empty samp_clk_src string is stored as None."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        mock_ni_task.timing.samp_clk_src = ""
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+        assert task.clock_source is None
+
+    def test_unexpected_sample_mode_defaults_to_continuous(self, mock_system,
+                                                           mock_constants):
+        """An unrecognized samp_quant_samp_mode value yields the safe default."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        mock_ni_task.timing.samp_quant_samp_mode = "HW_TIMED_SINGLE_POINT"
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+        assert task.sample_mode_str == "continuous"
+        assert task.samples_per_channel is None
+
+    def test_samples_per_channel_failure_warns_and_defaults(self, mock_system,
+                                                            mock_constants):
+        """A failing samp_quant_samp_per_chan read warns and stores None."""
+        from unittest.mock import PropertyMock
+
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        mock_ni_task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.FINITE
+        type(mock_ni_task.timing).samp_quant_samp_per_chan = PropertyMock(
+            side_effect=RuntimeError("driver error")
+        )
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AITask.from_task(mock_ni_task)
+
+        assert task.samples_per_channel is None
+        assert any("samples" in str(x.message).lower() or
+                   "finite" in str(x.message).lower() for x in w)
+
+    def test_clock_source_failure_warns_and_defaults(self, mock_system,
+                                                     mock_constants):
+        """A failing samp_clk_src read warns and stores None."""
+        from unittest.mock import PropertyMock
+
+        mock_ni_task = _make_external_ai_task(mock_constants)
+        type(mock_ni_task.timing).samp_clk_src = PropertyMock(
+            side_effect=RuntimeError("driver error")
+        )
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AITask.from_task(mock_ni_task)
+
+        assert task.clock_source is None
+        assert any("clock" in str(x.message).lower() for x in w)
