@@ -1826,3 +1826,100 @@ class TestFromName:
             from nidaqwrapper.ao_task import AOTask
             with pytest.raises(RuntimeError, match="already loaded"):
                 AOTask.from_name("BusyTask")
+
+
+# ===========================================================================
+# task-sync-configuration: set_start_trigger() (inherited from BaseTask)
+# ===========================================================================
+
+def _make_external_ao_task(mock_constants) -> MagicMock:
+    """Create a minimal external mock nidaqmx task for from_task() tests."""
+    task = MagicMock()
+    task.name = "external_task"
+
+    ch = MagicMock()
+    ch.name = "ao_0"
+    ch.physical_channel.name = "cDAQ1Mod1/ao0"
+    task.ao_channels = [ch]
+    task.channel_names = ["ao_0"]
+
+    task.timing.samp_clk_rate = 10000
+    task.timing.samp_quant_samp_per_chan = 50000
+    task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+class TestAOSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on AOTask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/Dev1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                task.set_start_trigger("/Dev1/PFI0", edge="level")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(0)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_ao_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.set_start_trigger("/Dev1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()

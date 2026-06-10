@@ -2932,3 +2932,188 @@ class TestFromNameDO:
             from nidaqwrapper.digital import DOTask
             with pytest.raises(RuntimeError, match="already loaded"):
                 DOTask.from_name("BusyTask")
+
+
+# ===========================================================================
+# task-sync-configuration: set_start_trigger() (inherited from BaseTask)
+# ===========================================================================
+
+def _make_external_digital_task(channel_attr: str) -> MagicMock:
+    """Create a minimal external mock nidaqmx task for from_task() tests.
+
+    Parameters
+    ----------
+    channel_attr : str
+        Either ``"di_channels"`` or ``"do_channels"``.
+    """
+    task = MagicMock()
+    task.name = "external_task"
+
+    ch = MagicMock()
+    ch.name = "ch0"
+    ch.physical_channel.name = "Dev1/port0/line0"
+    setattr(task, channel_attr, [ch])
+    task.channel_names = ["ch0"]
+
+    task.timing.samp_clk_rate = 1000
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+class TestDITaskSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on DITask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/cDAQ1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                di.set_start_trigger("/cDAQ1/PFI0", edge="both")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger(["PFI0"])
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_on_demand_mode_allowed(self, mock_system, mock_constants):
+        """Design decision 3: no ordering/timing constraint enforced on trigger
+        configuration — it also works on an on-demand DITask."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI0")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                di.set_start_trigger("/cDAQ1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+class TestDOTaskSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on DOTask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.set_start_trigger("/cDAQ1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/cDAQ1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.set_start_trigger("/cDAQ1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                do.set_start_trigger("/cDAQ1/PFI0", edge="rise")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger(7)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                do.set_start_trigger("/cDAQ1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()

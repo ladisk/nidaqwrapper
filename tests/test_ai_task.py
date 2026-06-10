@@ -2549,3 +2549,110 @@ class TestFromName:
             from nidaqwrapper.ai_task import AITask
             with pytest.raises(RuntimeError, match="NI-DAQmx drivers"):
                 AITask.from_name("AnyTask")
+
+
+# ===========================================================================
+# task-sync-configuration: set_start_trigger() (inherited from BaseTask)
+# ===========================================================================
+
+def _make_external_ai_task(mock_constants):
+    """Create a minimal external mock nidaqmx task for from_task() tests."""
+    mock_ni_task = MagicMock()
+    mock_ni_task.name = "external_task"
+    mock_ni_task.timing.samp_clk_rate = 25600
+    mock_ni_task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+    mock_ni_task.timing.samp_clk_src = ""
+
+    mock_ch = MagicMock()
+    mock_ch.name = "ai0"
+    mock_ni_task.ai_channels = [mock_ch]
+    mock_ni_task.channel_names = ["ai0"]
+    mock_ni_task.is_task_done.return_value = True
+    return mock_ni_task
+
+
+class TestSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/Dev1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/Dev1/PFI1"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                task.set_start_trigger("/Dev1/PFI0", edge="both")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(123)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        mock_ni_task = _make_external_ai_task(mock_constants)
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.set_start_trigger("/Dev1/PFI0")
+
+        mock_ni_task.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_works_without_channels(self, mock_system, mock_constants):
+        """Design decision 3: no ordering constraint enforced — trigger config
+        is independent of channels/timing, so no channel gate applies."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            # No add_channel() call — trigger configuration must still work
+            task.set_start_trigger("/Dev1/PFI0")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once()
