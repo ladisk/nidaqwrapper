@@ -1223,3 +1223,684 @@ class TestThreadSafety:
 
         adv.acquire()
         lock.__enter__.assert_called()
+
+
+# ===================================================================
+# Change multi-handler-advanced-acquisition
+# Group 1: Hardware trigger hooks
+# ===================================================================
+
+
+class TestSetHardwareTriggerFunctions:
+    """Group 1 — set_hardware_trigger_functions() registration."""
+
+    def test_hooks_default_none_at_init(self, adv):
+        """1.1 Both hook attributes default to None."""
+        assert adv._hw_trigger_start_fn is None
+        assert adv._hw_trigger_support_fn is None
+
+    def test_register_both_hooks(self, adv):
+        """1.1 Both callables are stored."""
+        def start_fn():
+            pass
+
+        def support_fn(mode):
+            pass
+
+        adv.set_hardware_trigger_functions(
+            start_function=start_fn, support_function=support_fn
+        )
+        assert adv._hw_trigger_start_fn is start_fn
+        assert adv._hw_trigger_support_fn is support_fn
+
+    def test_register_start_only(self, adv):
+        """1.1 Registering only start_function leaves support hook None."""
+        def start_fn():
+            pass
+
+        adv.set_hardware_trigger_functions(start_function=start_fn)
+        assert adv._hw_trigger_start_fn is start_fn
+        assert adv._hw_trigger_support_fn is None
+
+    def test_clear_hooks_with_no_args(self, adv):
+        """1.1 Calling with no arguments clears previously registered hooks."""
+        adv.set_hardware_trigger_functions(
+            start_function=lambda: None, support_function=lambda m: None
+        )
+        adv.set_hardware_trigger_functions()
+        assert adv._hw_trigger_start_fn is None
+        assert adv._hw_trigger_support_fn is None
+
+    def test_non_callable_start_raises_typeerror(self, adv):
+        """1.1 Non-callable start_function raises TypeError."""
+        with pytest.raises(TypeError, match="start_function"):
+            adv.set_hardware_trigger_functions(start_function=42)
+
+    def test_non_callable_support_raises_typeerror(self, adv):
+        """1.1 Non-callable support_function raises TypeError."""
+        with pytest.raises(TypeError, match="support_function"):
+            adv.set_hardware_trigger_functions(support_function="not-callable")
+
+    def test_typeerror_leaves_hook_state_unchanged(self, adv):
+        """1.1 On TypeError, no hook state changes (spec scenario)."""
+        def start_fn():
+            pass
+
+        def support_fn(mode):
+            pass
+
+        adv.set_hardware_trigger_functions(
+            start_function=start_fn, support_function=support_fn
+        )
+
+        # Bad first argument — neither hook may change
+        with pytest.raises(TypeError):
+            adv.set_hardware_trigger_functions(
+                start_function=1, support_function=lambda m: None
+            )
+        assert adv._hw_trigger_start_fn is start_fn
+        assert adv._hw_trigger_support_fn is support_fn
+
+        # Bad second argument — neither hook may change (validate-then-assign)
+        with pytest.raises(TypeError):
+            adv.set_hardware_trigger_functions(
+                start_function=lambda: None, support_function=2
+            )
+        assert adv._hw_trigger_start_fn is start_fn
+        assert adv._hw_trigger_support_fn is support_fn
+
+
+class TestHardwareTriggerHookInvocation:
+    """Group 1 — hook invocation order in acquire_with_hardware_trigger()."""
+
+    def _make_ordered_tasks(self, adv, call_order):
+        """Create two input tasks that record start/read/stop call order."""
+        t1 = _make_nidaqmx_task("Task1", channel_names=["ch0"])
+        t2 = _make_nidaqmx_task("Task2", channel_names=["ch1"])
+        t1.start.side_effect = lambda: call_order.append("start_t1")
+        t2.start.side_effect = lambda: call_order.append("start_t2")
+        t1.read.side_effect = lambda **kw: (call_order.append("read_t1"), [1.0, 2.0])[1]
+        t2.read.side_effect = lambda **kw: (call_order.append("read_t2"), [3.0, 4.0])[1]
+        t1.stop.side_effect = lambda: call_order.append("stop_t1")
+        t2.stop.side_effect = lambda: call_order.append("stop_t2")
+        adv.input_tasks = [t1, t2]
+        return t1, t2
+
+    def test_support_called_before_arming(self, adv):
+        """1.2 support_function(custom_mode) runs before any task.start()."""
+        call_order = []
+        self._make_ordered_tasks(adv, call_order)
+        adv.set_hardware_trigger_functions(
+            support_function=lambda mode: call_order.append(f"support:{mode}")
+        )
+
+        adv.acquire_with_hardware_trigger(custom_mode="modeA")
+
+        assert call_order[0] == "support:modeA"
+        assert call_order.index("support:modeA") < call_order.index("start_t1")
+
+    def test_support_skipped_without_custom_mode(self, adv):
+        """1.2 support_function not called when custom_mode is None."""
+        call_order = []
+        self._make_ordered_tasks(adv, call_order)
+        support = MagicMock()
+        start = MagicMock()
+        adv.set_hardware_trigger_functions(
+            start_function=start, support_function=support
+        )
+
+        adv.acquire_with_hardware_trigger()
+
+        support.assert_not_called()
+        start.assert_called_once_with()
+
+    def test_support_skipped_when_unset_with_custom_mode(self, adv):
+        """1.2 custom_mode with no support hook set runs without error."""
+        call_order = []
+        self._make_ordered_tasks(adv, call_order)
+
+        result = adv.acquire_with_hardware_trigger(custom_mode="modeB")
+
+        assert "Task1" in result and "Task2" in result
+
+    def test_start_fn_called_after_arming_before_reads(self, adv):
+        """1.2 start_function() runs after every task.start(), before reads."""
+        call_order = []
+        self._make_ordered_tasks(adv, call_order)
+        adv.set_hardware_trigger_functions(
+            start_function=lambda: call_order.append("start_fn")
+        )
+
+        adv.acquire_with_hardware_trigger()
+
+        start_fn_idx = call_order.index("start_fn")
+        assert call_order.index("start_t1") < start_fn_idx
+        assert call_order.index("start_t2") < start_fn_idx
+        assert start_fn_idx < call_order.index("read_t1")
+        assert start_fn_idx < call_order.index("read_t2")
+
+    def test_full_hook_sequence(self, adv):
+        """1.2 Full sequence: support → arm all → start_fn → read all → stop all."""
+        call_order = []
+        self._make_ordered_tasks(adv, call_order)
+        adv.set_hardware_trigger_functions(
+            start_function=lambda: call_order.append("start_fn"),
+            support_function=lambda mode: call_order.append("support"),
+        )
+
+        result = adv.acquire_with_hardware_trigger(custom_mode="modeA")
+
+        assert call_order == [
+            "support",
+            "start_t1", "start_t2",
+            "start_fn",
+            "read_t1", "read_t2",
+            "stop_t1", "stop_t2",
+        ]
+        assert "Task1" in result and "Task2" in result
+
+    def test_start_fn_failure_stops_armed_tasks(self, adv):
+        """1.2 start_function raising → all armed tasks stopped, exception propagates."""
+        call_order = []
+        t1, t2 = self._make_ordered_tasks(adv, call_order)
+
+        def failing_start():
+            raise RuntimeError("PLC trigger failed")
+
+        adv.set_hardware_trigger_functions(start_function=failing_start)
+
+        with pytest.raises(RuntimeError, match="PLC trigger failed"):
+            adv.acquire_with_hardware_trigger()
+
+        t1.stop.assert_called_once()
+        t2.stop.assert_called_once()
+
+    def test_support_failure_propagates_no_tasks_started(self, adv):
+        """1.2 support_function raising before arming → no task started."""
+        call_order = []
+        t1, t2 = self._make_ordered_tasks(adv, call_order)
+
+        def failing_support(mode):
+            raise RuntimeError("mode selection failed")
+
+        adv.set_hardware_trigger_functions(support_function=failing_support)
+
+        with pytest.raises(RuntimeError, match="mode selection failed"):
+            adv.acquire_with_hardware_trigger(custom_mode="modeA")
+
+        t1.start.assert_not_called()
+        t2.start.assert_not_called()
+        t1.stop.assert_not_called()
+        t2.stop.assert_not_called()
+
+    def test_read_failure_stops_started_tasks(self, adv):
+        """1.2 Read raising mid-acquisition → already-started tasks stopped."""
+        call_order = []
+        t1, t2 = self._make_ordered_tasks(adv, call_order)
+        t1.read.side_effect = RuntimeError("read failed")
+
+        with pytest.raises(RuntimeError, match="read failed"):
+            adv.acquire_with_hardware_trigger()
+
+        t1.stop.assert_called_once()
+        t2.stop.assert_called_once()
+
+    def test_stop_failure_during_cleanup_warns(self, adv):
+        """1.2 task.stop() failure during cleanup warns, does not mask data."""
+        import warnings as warnings_mod
+
+        t1 = _make_nidaqmx_task("Task1", channel_names=["ch0"])
+        t1.read.return_value = [1.0, 2.0]
+        t1.stop.side_effect = RuntimeError("stop failed")
+        adv.input_tasks = [t1]
+
+        with warnings_mod.catch_warnings(record=True) as w:
+            warnings_mod.simplefilter("always")
+            result = adv.acquire_with_hardware_trigger()
+
+        assert "Task1" in result
+        assert any("stop failed" in str(x.message) for x in w)
+
+
+class TestAcquireCustomModePassThrough:
+    """Group 1 — acquire(custom_mode=...) pass-through and software-path warning."""
+
+    def test_acquire_passes_custom_mode_to_hardware_path(self, adv):
+        """1.4 acquire(custom_mode=...) forwards to acquire_with_hardware_trigger."""
+        adv.trigger_type = "hardware"
+        adv.input_tasks = [_make_nidaqmx_task()]
+        with patch.object(
+            adv, "acquire_with_hardware_trigger", return_value={}
+        ) as mock_hw:
+            adv.acquire(custom_mode="modeA")
+            mock_hw.assert_called_once_with(custom_mode="modeA")
+
+    def test_acquire_software_path_warns_and_ignores_custom_mode(self, adv):
+        """1.4 Software path warns when custom_mode provided and ignores it."""
+        import warnings as warnings_mod
+
+        adv.trigger_type = "software"
+        adv.input_tasks = [_make_nidaqmx_task()]
+        with patch.object(
+            adv, "acquire_with_software_trigger", return_value=np.array([])
+        ) as mock_sw:
+            with warnings_mod.catch_warnings(record=True) as w:
+                warnings_mod.simplefilter("always")
+                adv.acquire(custom_mode="modeA")
+
+            mock_sw.assert_called_once()
+            assert any("custom_mode" in str(x.message) for x in w)
+
+    def test_acquire_software_path_no_warning_without_custom_mode(self, adv):
+        """1.4 Software path emits no custom_mode warning when omitted."""
+        import warnings as warnings_mod
+
+        adv.trigger_type = "software"
+        adv.input_tasks = [_make_nidaqmx_task()]
+        with patch.object(
+            adv, "acquire_with_software_trigger", return_value=np.array([])
+        ):
+            with warnings_mod.catch_warnings(record=True) as w:
+                warnings_mod.simplefilter("always")
+                adv.acquire()
+
+            assert not any("custom_mode" in str(x.message) for x in w)
+
+
+# ===================================================================
+# Change multi-handler-advanced-acquisition
+# Group 2: Non-blocking acquire (Future)
+# ===================================================================
+
+
+class TestMultiHandlerNonBlocking:
+    """Group 2 — acquire(blocking=False) returns a Future."""
+
+    def _setup_hardware(self, adv):
+        """Configure a hardware-trigger handler with one deterministic task."""
+        task = _make_nidaqmx_task("HWTask", channel_names=["ch0", "ch1"])
+        task.read.return_value = [[1.0, 2.0], [3.0, 4.0]]
+        adv.input_tasks = [task]
+        adv.trigger_type = "hardware"
+        return task
+
+    def test_blocking_true_returns_data_directly(self, adv):
+        """2.1 acquire(blocking=True) returns the data dict directly."""
+        self._setup_hardware(adv)
+        result = adv.acquire(blocking=True)
+        assert isinstance(result, dict)
+        assert "HWTask" in result
+
+    def test_blocking_false_returns_future(self, adv):
+        """2.1 acquire(blocking=False) returns a Future immediately."""
+        from concurrent.futures import Future
+
+        self._setup_hardware(adv)
+        future = adv.acquire(blocking=False)
+        assert isinstance(future, Future)
+        future.result(timeout=5)
+
+    def test_future_result_matches_blocking_result(self, adv):
+        """2.1 future.result() yields the same structure as blocking acquire."""
+        self._setup_hardware(adv)
+
+        blocking_result = adv.acquire(blocking=True)
+        future = adv.acquire(blocking=False)
+        nb_result = future.result(timeout=5)
+
+        assert set(nb_result.keys()) == set(blocking_result.keys())
+        for task_name in blocking_result:
+            assert set(nb_result[task_name]) == set(blocking_result[task_name])
+            for ch in blocking_result[task_name]:
+                np.testing.assert_array_equal(
+                    nb_result[task_name][ch], blocking_result[task_name][ch]
+                )
+
+    def test_executor_lazily_created(self, adv):
+        """2.1 Executor is None at init and created on first non-blocking acquire."""
+        assert adv._executor is None
+
+        self._setup_hardware(adv)
+        adv.acquire(blocking=True)
+        assert adv._executor is None  # blocking acquire must not create it
+
+        future = adv.acquire(blocking=False)
+        future.result(timeout=5)
+        assert adv._executor is not None
+
+    def test_executor_reused_across_calls(self, adv):
+        """2.1 The same single-worker executor is reused for later calls."""
+        self._setup_hardware(adv)
+        f1 = adv.acquire(blocking=False)
+        f1.result(timeout=5)
+        executor = adv._executor
+        f2 = adv.acquire(blocking=False)
+        f2.result(timeout=5)
+        assert adv._executor is executor
+
+    def test_del_shuts_down_executor(self, adv):
+        """2.1 __del__ shuts down a created executor."""
+        mock_executor = MagicMock()
+        adv._executor = mock_executor
+        adv.__del__()
+        mock_executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_del_without_executor_does_not_raise(self, adv):
+        """2.1 __del__ is safe when the executor was never created."""
+        assert adv._executor is None
+        adv.__del__()  # must not raise
+
+    def test_nonblocking_acquires_lock_in_worker(self, adv):
+        """2.2 The RLock is acquired inside the submitted callable."""
+        self._setup_hardware(adv)
+
+        lock = MagicMock()
+        lock.__enter__ = MagicMock(return_value=None)
+        lock.__exit__ = MagicMock(return_value=False)
+        adv._lock = lock
+
+        future = adv.acquire(blocking=False)
+        # The Future is returned before/independently of lock acquisition;
+        # the lock must be taken by the worker thread.
+        future.result(timeout=5)
+        lock.__enter__.assert_called()
+
+
+# ===================================================================
+# Change multi-handler-advanced-acquisition
+# Group 3: State/health introspection
+# ===================================================================
+
+
+class TestMultiHandlerCheckState:
+    """Group 3 — check_state() with auto-reconnect."""
+
+    def test_connect_sets_connect_called_flag(self, adv):
+        """3.1 connect() sets the _connect_called flag."""
+        assert adv._connect_called is False
+        with patch.object(adv, "_define_required_devices"):
+            with patch.object(adv, "ping", return_value=True):
+                adv.connect()
+        assert adv._connect_called is True
+
+    def test_connect_called_flag_set_even_when_connect_fails(self, adv):
+        """3.1 _connect_called is set even when connect() fails."""
+        with patch.object(adv, "_define_required_devices"):
+            with patch.object(adv, "ping", return_value=False):
+                adv.connect()
+        assert adv._connect_called is True
+
+    def test_check_state_disconnected_when_never_connected(self, adv):
+        """3.1 check_state() returns 'disconnected' before connect()."""
+        assert adv.check_state() == "disconnected"
+
+    def test_check_state_connected_when_ping_passes(self, adv):
+        """3.1 check_state() returns 'connected' when connected and ping OK."""
+        adv._connected = True
+        adv._connect_called = True
+        with patch.object(adv, "ping", return_value=True):
+            assert adv.check_state() == "connected"
+
+    def test_check_state_reconnected_after_lost_connection(self, adv):
+        """3.1 check_state() retries connect() and returns 'reconnected'."""
+        adv._connected = False
+        adv._connect_called = True
+        with patch.object(adv, "connect", return_value=True) as mock_connect:
+            assert adv.check_state() == "reconnected"
+            mock_connect.assert_called_once()
+
+    def test_check_state_connection_lost_when_reconnect_fails(self, adv):
+        """3.1 check_state() returns 'connection lost' when reconnect fails."""
+        adv._connected = False
+        adv._connect_called = True
+        with patch.object(adv, "connect", return_value=False):
+            assert adv.check_state() == "connection lost"
+
+    def test_check_state_reconnects_when_connected_but_ping_fails(self, adv):
+        """3.1 Connected handler with failing ping attempts reconnect."""
+        adv._connected = True
+        adv._connect_called = True
+        with patch.object(adv, "ping", return_value=False):
+            with patch.object(adv, "connect", return_value=True):
+                assert adv.check_state() == "reconnected"
+
+    def test_check_state_connection_lost_when_connected_ping_and_reconnect_fail(self, adv):
+        """3.1 Connected handler: ping fails and reconnect fails → 'connection lost'."""
+        adv._connected = True
+        adv._connect_called = True
+        with patch.object(adv, "ping", return_value=False):
+            with patch.object(adv, "connect", return_value=False):
+                assert adv.check_state() == "connection lost"
+
+
+class TestMultiHandlerIsRunning:
+    """Group 3 — is_running() across input and output tasks."""
+
+    def test_no_tasks_returns_false(self, adv):
+        """3.2 No tasks → False."""
+        assert adv.is_running() is False
+
+    def test_running_input_task_returns_true(self, adv):
+        """3.2 An input task with is_task_done()==False → True."""
+        task = _make_nidaqmx_task("In1")
+        task.is_task_done.return_value = False
+        adv.input_tasks = [task]
+        assert adv.is_running() is True
+
+    def test_running_output_task_returns_true(self, adv):
+        """3.2 An output task with is_task_done()==False → True."""
+        task = _make_nidaqmx_task("Out1")
+        task.is_task_done.return_value = True
+        out_task = _make_nidaqmx_task("Out2")
+        out_task.is_task_done.return_value = False
+        adv.input_tasks = [task]
+        adv.output_tasks = [out_task]
+        assert adv.is_running() is True
+
+    def test_all_tasks_done_returns_false(self, adv):
+        """3.2 All tasks done → False."""
+        t1 = _make_nidaqmx_task("In1")
+        t1.is_task_done.return_value = True
+        t2 = _make_nidaqmx_task("Out1")
+        t2.is_task_done.return_value = True
+        adv.input_tasks = [t1]
+        adv.output_tasks = [t2]
+        assert adv.is_running() is False
+
+    def test_daqerror_warns_and_treats_task_as_not_running(self, adv, advanced_module):
+        """3.2 DaqError during query → warning, task treated as not running."""
+        import warnings as warnings_mod
+
+        task = _make_nidaqmx_task("Broken")
+        error = advanced_module.DaqError("task closed")
+        error.error_code = -200088
+        task.is_task_done.side_effect = error
+        adv.input_tasks = [task]
+
+        with warnings_mod.catch_warnings(record=True) as w:
+            warnings_mod.simplefilter("always")
+            result = adv.is_running()
+
+        assert result is False
+        assert any("task closed" in str(x.message) for x in w)
+
+    def test_daqerror_on_one_task_other_running_returns_true(self, adv, advanced_module):
+        """3.2 DaqError on one task does not hide another running task."""
+        import warnings as warnings_mod
+
+        broken = _make_nidaqmx_task("Broken")
+        error = advanced_module.DaqError("invalid task")
+        error.error_code = -200088
+        broken.is_task_done.side_effect = error
+
+        running = _make_nidaqmx_task("Running")
+        running.is_task_done.return_value = False
+
+        adv.input_tasks = [broken, running]
+
+        with warnings_mod.catch_warnings(record=True):
+            warnings_mod.simplefilter("always")
+            assert adv.is_running() is True
+
+
+class TestMultiHandlerGetDeviceInfo:
+    """Group 3 — get_device_info() nested per-task metadata."""
+
+    def test_no_tasks_returns_empty_dict(self, adv):
+        """3.2 No tasks → empty dict."""
+        assert adv.get_device_info() == {}
+
+    def test_input_tasks_only(self, adv):
+        """3.2 Input tasks only → 'input' key only, nested per task."""
+        task = _make_nidaqmx_task(
+            "InTask", channel_names=["ch0", "ch1"], samp_clk_rate=25600.0
+        )
+        adv.input_tasks = [task]
+
+        info = adv.get_device_info()
+        assert set(info.keys()) == {"input"}
+        assert info["input"]["InTask"]["channel_names"] == ["ch0", "ch1"]
+        assert info["input"]["InTask"]["sample_rate"] == 25600.0
+        assert isinstance(info["input"]["InTask"]["sample_rate"], float)
+
+    def test_output_tasks_only(self, adv):
+        """3.2 Output tasks only → 'output' key only."""
+        task = _make_nidaqmx_task(
+            "OutTask", channel_names=["ao0"], samp_clk_rate=10000.0
+        )
+        adv.output_tasks = [task]
+
+        info = adv.get_device_info()
+        assert set(info.keys()) == {"output"}
+        assert info["output"]["OutTask"]["channel_names"] == ["ao0"]
+        assert info["output"]["OutTask"]["sample_rate"] == 10000.0
+
+    def test_input_and_output_tasks(self, adv):
+        """3.2 Both task lists populated → both keys, one entry per task."""
+        in1 = _make_nidaqmx_task("In1", channel_names=["a0"])
+        in2 = _make_nidaqmx_task("In2", channel_names=["a1", "a2"])
+        out1 = _make_nidaqmx_task("Out1", channel_names=["ao0"])
+        adv.input_tasks = [in1, in2]
+        adv.output_tasks = [out1]
+
+        info = adv.get_device_info()
+        assert set(info.keys()) == {"input", "output"}
+        assert set(info["input"].keys()) == {"In1", "In2"}
+        assert set(info["output"].keys()) == {"Out1"}
+        assert info["input"]["In2"]["channel_names"] == ["a1", "a2"]
+
+
+# ===================================================================
+# Change multi-handler-advanced-acquisition
+# Group 4: Acquisition abort (stop_acquisition)
+# ===================================================================
+
+
+class TestMultiHandlerStopAcquisition:
+    """Group 4 — stop_acquisition() cooperative abort."""
+
+    def test_acquire_running_defaults_false(self, adv):
+        """4.1 _acquire_running defaults to False."""
+        assert adv._acquire_running is False
+
+    def test_noop_when_idle(self, adv):
+        """4.1 stop_acquisition() with no acquisition in flight is a no-op."""
+        adv.stop_acquisition()  # must not raise
+        assert adv._acquire_running is False
+
+    def test_stop_acquisition_does_not_take_lock(self, adv):
+        """4.1 stop_acquisition() must not block on the RLock (deadlock avoidance)."""
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with adv._lock:
+                locked.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert locked.wait(timeout=5)
+
+        adv._acquire_running = True
+        stopper = threading.Thread(target=adv.stop_acquisition)
+        stopper.start()
+        stopper.join(timeout=1.0)
+        still_blocked = stopper.is_alive()
+        release.set()
+        holder.join(timeout=5)
+        stopper.join(timeout=5)
+
+        assert not still_blocked, "stop_acquisition() blocked on the RLock"
+        assert adv._acquire_running is False
+
+    def test_abort_software_polling_loop(self, adv):
+        """4.1 Abort: loop exits, task stopped, ring-buffer contents returned."""
+        task = _make_nidaqmx_task("SWTask", channel_names=["ch0"])
+        read_started = threading.Event()
+
+        def read_side_effect(**kw):
+            read_started.set()
+            return [0.0] * 10
+
+        task.read.side_effect = read_side_effect
+        adv.input_tasks = [task]
+        adv.input_channels = ["ch0"]
+        adv.input_sample_rate = 1000.0
+        adv.trigger_type = "software"
+
+        trigger = MagicMock()
+        trigger.ringbuff = MagicMock()
+        trigger.rows = 100
+        trigger.rows_left = 100
+        trigger.finished = False  # never fires
+        ring = np.arange(10, dtype=float).reshape(10, 1)
+        trigger.get_data.return_value = ring
+        adv.trigger = trigger
+        adv._trigger_is_set = True
+
+        future = adv.acquire(blocking=False)
+        assert read_started.wait(timeout=5), "acquisition loop never started"
+        adv.stop_acquisition()
+        result = future.result(timeout=5)
+
+        task.stop.assert_called_once()
+        assert isinstance(result, dict)
+        np.testing.assert_array_equal(result["ch0"], ring[:, 0])
+        assert "time" in result
+
+    def test_flag_reset_true_at_start_of_each_acquire(self, adv):
+        """4.1 A stale False flag (from a prior abort) is reset on the next acquire."""
+        task = _make_nidaqmx_task("SWTask", channel_names=["ch0"])
+        task.read.return_value = [0.0] * 10
+        adv.input_tasks = [task]
+        adv.input_channels = ["ch0"]
+        adv.input_sample_rate = 1000.0
+
+        trigger = MagicMock()
+        trigger.ringbuff = MagicMock()
+        trigger.rows = 100
+        trigger.rows_left = 100
+        trigger.finished = False
+        trigger.add_data.side_effect = lambda data: setattr(trigger, "finished", True)
+        trigger.get_data.return_value = np.zeros((100, 1))
+        adv.trigger = trigger
+        adv._trigger_is_set = True
+
+        adv._acquire_running = False  # stale flag from a previous abort
+        result = adv.acquire_with_software_trigger(return_dict=False)
+
+        assert trigger.add_data.call_count >= 1, "loop never ran — flag not reset"
+        assert isinstance(result, np.ndarray)
+
+    def test_abort_does_not_affect_hardware_path(self, adv):
+        """4.1 Hardware-trigger acquisition ignores the abort flag (blocking reads)."""
+        task = _make_nidaqmx_task("HWTask", channel_names=["ch0"])
+        task.read.return_value = [1.0, 2.0]
+        adv.input_tasks = [task]
+        adv.trigger_type = "hardware"
+
+        adv._acquire_running = False  # would abort the software loop
+        result = adv.acquire()
+        assert "HWTask" in result
+        task.read.assert_called_once()

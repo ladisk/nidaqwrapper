@@ -28,6 +28,8 @@ from __future__ import annotations
 import threading
 import time
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Callable
 
 import numpy as np
 
@@ -113,6 +115,14 @@ class MultiHandler:
         self._trigger_is_set: bool = False
         self.input_channels: list | None = None
         self.input_sample_rate: float | None = None
+        self._hw_trigger_start_fn: Callable | None = None
+        self._hw_trigger_support_fn: Callable | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        # Guards lazy executor creation only — never held during
+        # acquisition, so acquire(blocking=False) cannot block on it.
+        self._executor_lock: threading.Lock = threading.Lock()
+        self._connect_called: bool = False
+        self._acquire_running: bool = False
 
     # -----------------------------------------------------------------------
     # Public lifecycle
@@ -216,6 +226,7 @@ class MultiHandler:
             ``True`` when all required devices respond.  ``False`` otherwise.
         """
         with self._lock:
+            self._connect_called = True
             self._define_required_devices()
             result = self.ping()
             if result:
@@ -267,32 +278,250 @@ class MultiHandler:
             return True
         return False
 
+    def check_state(self) -> str:
+        """Check connection state with auto-reconnection.
+
+        Mirrors ``DAQHandler.check_state()``: when the connection appears
+        lost, a single :meth:`connect` retry is attempted.
+
+        Returns
+        -------
+        str
+            One of ``'connected'``, ``'reconnected'``,
+            ``'connection lost'``, or ``'disconnected'`` (when
+            :meth:`connect` was never called).
+        """
+        with self._lock:
+            if not self._connected:
+                if self._connect_called:
+                    if self.connect():
+                        return "reconnected"
+                    return "connection lost"
+                return "disconnected"
+
+            # Connected — verify with ping
+            if self.ping():
+                return "connected"
+
+            # Ping failed — attempt reconnect
+            if self.connect():
+                return "reconnected"
+
+            return "connection lost"
+
+    def is_running(self) -> bool:
+        """Return whether any configured task is currently running.
+
+        Queries ``is_task_done()`` on every input and output task.  The
+        query is intentionally lock-free so it can be called from a
+        watchdog thread while an acquisition (which holds the RLock) is in
+        flight.
+
+        Returns
+        -------
+        bool
+            ``True`` when any task reports ``is_task_done() == False``.
+            ``False`` when there are no tasks, all tasks are done, or every
+            query fails (a failing task warns and counts as not running).
+        """
+        running = False
+        for task in self.input_tasks + self.output_tasks:
+            try:
+                if not task.is_task_done():
+                    running = True
+            except DaqError as exc:
+                warnings.warn(
+                    f"is_task_done() failed — treating task as not "
+                    f"running: {exc}",
+                    stacklevel=2,
+                )
+        return running
+
+    def get_device_info(self) -> dict:
+        """Return per-task channel names and sample rates.
+
+        Returns
+        -------
+        dict
+            ``{'input': {task_name: {'channel_names': list[str],
+            'sample_rate': float}}, 'output': {...}}``.  The ``'input'`` /
+            ``'output'`` keys are present only when the corresponding task
+            list is non-empty; with no tasks an empty dict is returned.
+        """
+        def _per_task_info(tasks: list) -> dict:
+            return {
+                task.name: {
+                    "channel_names": list(task.channel_names),
+                    "sample_rate": float(task.timing.samp_clk_rate),
+                }
+                for task in tasks
+            }
+
+        info: dict = {}
+        if self.input_tasks:
+            info["input"] = _per_task_info(self.input_tasks)
+        if self.output_tasks:
+            info["output"] = _per_task_info(self.output_tasks)
+        return info
+
     # -----------------------------------------------------------------------
     # Acquisition
     # -----------------------------------------------------------------------
 
-    def acquire(self) -> dict | np.ndarray:
+    def acquire(
+        self,
+        custom_mode: object | None = None,
+        blocking: bool = True,
+    ) -> dict | np.ndarray | Future:
         """Acquire data, dispatching to hardware or software trigger path.
 
-        Uses the RLock to ensure thread safety during hardware access.
+        Parameters
+        ----------
+        custom_mode : object, optional
+            Forwarded to :meth:`acquire_with_hardware_trigger`, where it is
+            passed to the registered ``support_function`` hook.  Ignored
+            (with a warning) on the software-trigger path — hooks are a
+            hardware-trigger concept.
+        blocking : bool, optional
+            If ``True`` (default), block until acquisition completes.
+            If ``False``, submit the acquisition to a single-worker
+            executor and return a :class:`~concurrent.futures.Future`.
+
+        Returns
+        -------
+        dict or numpy.ndarray or Future
+            Result from :meth:`acquire_with_hardware_trigger` (dict) or
+            :meth:`acquire_with_software_trigger` (dict or ndarray), or a
+            Future wrapping either when *blocking* is ``False``.
+
+        Notes
+        -----
+        Do not block on the returned Future while holding this handler's
+        methods in the same thread that runs the acquisition loop — the
+        RLock is acquired inside the worker (same contract as
+        ``DAQHandler``).
+        """
+        if blocking:
+            return self._acquire_impl(custom_mode)
+        return self._get_executor().submit(self._acquire_impl, custom_mode)
+
+    def _acquire_impl(self, custom_mode: object | None = None) -> dict | np.ndarray:
+        """Synchronous acquisition implementation.
+
+        Called directly for blocking acquire, or submitted to the executor
+        for non-blocking.  The RLock is acquired here — inside the worker
+        thread for the non-blocking path — to ensure thread safety during
+        hardware access.
+
+        Parameters
+        ----------
+        custom_mode : object, optional
+            See :meth:`acquire`.
 
         Returns
         -------
         dict or numpy.ndarray
-            Result from :meth:`acquire_with_hardware_trigger` (dict) or
-            :meth:`acquire_with_software_trigger` (dict or ndarray).
+            Acquired data.
         """
         with self._lock:
             if self.trigger_type == "hardware":
-                return self.acquire_with_hardware_trigger()
+                return self.acquire_with_hardware_trigger(custom_mode=custom_mode)
+            if custom_mode is not None:
+                warnings.warn(
+                    "custom_mode is ignored for software-triggered "
+                    "acquisition — hardware-trigger hooks only apply to the "
+                    "hardware-trigger path.",
+                    stacklevel=2,
+                )
             return self.acquire_with_software_trigger()
 
-    def acquire_with_hardware_trigger(self) -> dict:
+    def _get_executor(self) -> ThreadPoolExecutor:
+        """Return the single-worker executor, creating it lazily.
+
+        Creation is guarded by a dedicated lock (not the RLock) so that
+        concurrent ``acquire(blocking=False)`` calls cannot race to create
+        two executors, and so this call never blocks on an in-flight
+        acquisition.
+
+        Returns
+        -------
+        concurrent.futures.ThreadPoolExecutor
+            Executor used for non-blocking acquisitions.
+        """
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1)
+            return self._executor
+
+    def __del__(self) -> None:
+        """Best-effort executor shutdown on garbage collection."""
+        try:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    def set_hardware_trigger_functions(
+        self,
+        start_function: Callable | None = None,
+        support_function: Callable | None = None,
+    ) -> None:
+        """Register hook callables for hardware-triggered acquisition.
+
+        Hooks are used by :meth:`acquire_with_hardware_trigger`:
+        ``support_function(custom_mode)`` runs before the input tasks are
+        armed (only when ``custom_mode`` is provided); ``start_function()``
+        runs after all input tasks are armed, to fire the physical trigger
+        line (e.g. via PLC or PFI).
+
+        Parameters
+        ----------
+        start_function : callable or None, optional
+            Called with no arguments after all input tasks are armed.
+            ``None`` (default) clears the hook.
+        support_function : callable or None, optional
+            Called with ``custom_mode`` before arming, when ``custom_mode``
+            is not ``None``.  ``None`` (default) clears the hook.
+
+        Raises
+        ------
+        TypeError
+            If either argument is neither callable nor ``None``.  No hook
+            state changes in that case.
+        """
+        # Validate both arguments before assigning either, so a TypeError
+        # leaves the hook state unchanged.
+        if start_function is not None and not callable(start_function):
+            raise TypeError(
+                f"start_function must be callable or None, "
+                f"got {type(start_function).__name__}."
+            )
+        if support_function is not None and not callable(support_function):
+            raise TypeError(
+                f"support_function must be callable or None, "
+                f"got {type(support_function).__name__}."
+            )
+        self._hw_trigger_start_fn = start_function
+        self._hw_trigger_support_fn = support_function
+
+    def acquire_with_hardware_trigger(
+        self, custom_mode: object | None = None
+    ) -> dict:
         """Acquire finite data from all input tasks using a hardware trigger.
 
-        All tasks are started first (they arm and wait for the trigger),
-        then data is read from each task after the trigger fires, then all
-        tasks are stopped.
+        The registered ``support_function`` hook (if any) is called with
+        *custom_mode* before arming, when *custom_mode* is not ``None``.
+        All tasks are then started (they arm and wait for the trigger), the
+        registered ``start_function`` hook (if any) fires the physical
+        trigger line, data is read from each task, and all started tasks
+        are stopped — also when a hook or read raises.
+
+        Parameters
+        ----------
+        custom_mode : object, optional
+            Mode identifier forwarded to the ``support_function`` hook
+            (e.g. selects a test procedure on an EOL bench).  When ``None``
+            (default), the support hook is skipped.
 
         Returns
         -------
@@ -307,31 +536,55 @@ class MultiHandler:
         have a known sample count configured via ``samps_per_chan``.
         Single-channel tasks return 1-D data from nidaqmx; this method
         normalises all outputs to 1-D NumPy arrays keyed by channel name.
+        Failures while stopping tasks during cleanup are reported via
+        :func:`warnings.warn` so they cannot mask acquired data or the
+        original exception.
         """
         acquired_data: dict = {}
 
-        # Start all tasks before reading — they arm and wait for the trigger.
-        for task in self.input_tasks:
-            task.start()
+        # Support hook runs before arming — selects e.g. a bench test mode.
+        # Exact OpenEOL semantics: only when the hook is set AND a mode is
+        # given.  No tasks are armed yet, so a hook failure leaks nothing.
+        if self._hw_trigger_support_fn is not None and custom_mode is not None:
+            self._hw_trigger_support_fn(custom_mode)
 
-        for task in self.input_tasks:
-            raw = task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE)
-            channel_names = task.channel_names
-            channel_data: dict = {}
+        started: list = []
+        try:
+            # Start all tasks before reading — they arm and wait for the
+            # trigger.
+            for task in self.input_tasks:
+                task.start()
+                started.append(task)
 
-            raw_array = np.array(raw)
-            if raw_array.ndim == 1:
-                # Single-channel: nidaqmx returns a 1-D list
-                channel_data[channel_names[0]] = raw_array
-            else:
-                # Multi-channel: shape is (n_channels, n_samples)
-                for channel_name, signal in zip(channel_names, raw_array):
-                    channel_data[channel_name] = np.array(signal)
+            # Start hook fires the physical trigger line once all tasks are
+            # armed (only if registered).
+            if self._hw_trigger_start_fn is not None:
+                self._hw_trigger_start_fn()
 
-            acquired_data[task.name] = channel_data
+            for task in self.input_tasks:
+                raw = task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE)
+                channel_names = task.channel_names
+                channel_data: dict = {}
 
-        for task in self.input_tasks:
-            task.stop()
+                raw_array = np.array(raw)
+                if raw_array.ndim == 1:
+                    # Single-channel: nidaqmx returns a 1-D list
+                    channel_data[channel_names[0]] = raw_array
+                else:
+                    # Multi-channel: shape is (n_channels, n_samples)
+                    for channel_name, signal in zip(channel_names, raw_array):
+                        channel_data[channel_name] = np.array(signal)
+
+                acquired_data[task.name] = channel_data
+        finally:
+            # Stop every task that was started — also on hook/read failure
+            # (OpenEOL leaked armed tasks here).  Stop failures warn so they
+            # cannot mask the data or the original exception.
+            for task in started:
+                try:
+                    task.stop()
+                except Exception as exc:
+                    warnings.warn(str(exc), stacklevel=2)
 
         return acquired_data
 
@@ -362,6 +615,13 @@ class MultiHandler:
             If more than one input task is configured (software triggering
             is single-task only — reads are sequential and cannot synchronise
             multiple tasks).
+
+        Notes
+        -----
+        The polling loop can be aborted from another thread via
+        :meth:`stop_acquisition`.  An aborted acquisition stops the input
+        task and returns the current trigger ring-buffer contents —
+        possibly untriggered or partial data.
         """
         if len(self.input_tasks) > 1:
             raise ValueError(
@@ -380,6 +640,11 @@ class MultiHandler:
 
         self._reset_trigger()
 
+        # Reset the abort flag at the start of every acquisition so a stale
+        # False value (left by a previous stop_acquisition() call) cannot
+        # abort this run before it starts.
+        self._acquire_running = True
+
         # Bug fix #3 — start the task before attempting any reads.
         # OpenEOL's base_advanced.py omitted this call, so reads were issued
         # against a task that was never started.
@@ -388,8 +653,9 @@ class MultiHandler:
         # Flush stale samples from the hardware buffer before acquisition.
         task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE, timeout=0.5)
 
-        # Main acquisition loop — read until pyTrigger reports done.
-        while not self.trigger.finished:
+        # Main acquisition loop — read until pyTrigger reports done or
+        # stop_acquisition() clears the abort flag from another thread.
+        while not self.trigger.finished and self._acquire_running:
             raw_data = np.array(
                 task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE, timeout=0.5)
             )
@@ -401,6 +667,7 @@ class MultiHandler:
             data = raw_data.T
             self.trigger.add_data(data)
 
+        self._acquire_running = False
         time.sleep(0.05)
         task.stop()
 
@@ -416,6 +683,27 @@ class MultiHandler:
             return result
 
         return self.trigger.get_data()
+
+    def stop_acquisition(self) -> None:
+        """Cooperatively abort an in-flight software-triggered acquisition.
+
+        Clears the abort flag checked by the polling loop in
+        :meth:`acquire_with_software_trigger`.  The aborted acquisition
+        stops the input task and returns the current trigger ring-buffer
+        contents (possibly untriggered or partial data).  Calling this with
+        no acquisition in flight is a no-op.
+
+        Notes
+        -----
+        Hardware-triggered acquisitions use blocking driver reads and are
+        **not** affected by this method.
+        """
+        # Deliberately does NOT take self._lock: the acquisition loop holds
+        # the RLock for the entire acquisition, so taking it here (from the
+        # aborting thread) would deadlock until the acquisition finished —
+        # defeating the purpose.  A plain bool store is atomic under the
+        # GIL, so the flag itself needs no locking.
+        self._acquire_running = False
 
     # -----------------------------------------------------------------------
     # Trigger management
