@@ -46,10 +46,12 @@ from .utils import get_connected_devices, get_task_by_name
 try:
     import nidaqmx
     from nidaqmx.constants import READ_ALL_AVAILABLE
+    from nidaqmx.errors import DaqError
 
     _NIDAQMX_AVAILABLE = True
 except ImportError:
     _NIDAQMX_AVAILABLE = False
+    DaqError = Exception  # type: ignore[misc,assignment]
 
 try:
     from pyTrigger import pyTrigger
@@ -645,7 +647,9 @@ class DAQHandler:
         Returns
         -------
         numpy.ndarray or dict
-            Acquired data.
+            Acquired data.  When aborted via :meth:`stop_acquisition`, the
+            current trigger ring-buffer contents are returned — possibly
+            untriggered or partial data.
         """
         with self._lock:
             # Reset trigger state for fresh acquisition
@@ -660,9 +664,12 @@ class DAQHandler:
             except Exception:
                 pass  # Flush may return empty; ignore
 
-            # Main acquisition loop
+            # Main acquisition loop — runs until the trigger fires or
+            # stop_acquisition() clears the abort flag from another thread.
+            # The flag is reset True here (under the lock) so a stale False
+            # value from a previous abort cannot skip this acquisition.
             self._acquire_running = True
-            while self._acquire_running:
+            while not self.trigger.finished and self._acquire_running:
                 raw_data = np.array(
                     self._task_in.read(READ_ALL_AVAILABLE, timeout=0.5)
                 )
@@ -675,10 +682,9 @@ class DAQHandler:
                 data = raw_data.T
                 self.trigger.add_data(data)
 
-                if self.trigger.finished:
-                    self._acquire_running = False
-                else:
+                if not self.trigger.finished:
                     time.sleep(self.acquisition_sleep)
+            self._acquire_running = False
 
             # Post-trigger delay
             time.sleep(self.post_trigger_delay)
@@ -704,6 +710,22 @@ class DAQHandler:
         self.trigger.rows_left = self.trigger.rows
         self.trigger.finished = False
         self.trigger.first_data = True
+
+    def stop_acquisition(self) -> None:
+        """Cooperatively abort an in-flight triggered acquisition.
+
+        Clears the abort flag checked by the polling loop in
+        :meth:`_acquire_impl`.  The aborted acquisition stops the input
+        task and returns the current trigger ring-buffer contents
+        (possibly untriggered or partial data).  Calling this with no
+        acquisition in flight is a no-op.
+        """
+        # Deliberately does NOT take self._lock: the acquisition loop holds
+        # the RLock for the entire acquisition, so taking it here (from the
+        # aborting thread) would deadlock until the acquisition finished —
+        # defeating the purpose.  A plain bool store is atomic under the
+        # GIL, so the flag itself needs no locking.
+        self._acquire_running = False
 
     # ------------------------------------------------------------------
     # Read (LDAQ integration + single sample)
@@ -1042,6 +1064,51 @@ class DAQHandler:
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+
+    def is_running(self) -> bool:
+        """Return whether any active task is currently running.
+
+        Queries ``is_task_done()`` on the active analog input/output
+        nidaqmx tasks and the digital input/output tasks.  The query is
+        intentionally lock-free so it can be called from a watchdog thread
+        while an acquisition (which holds the RLock) is in flight.
+
+        Returns
+        -------
+        bool
+            ``True`` when any active task reports ``is_task_done() ==
+            False``.  ``False`` when not connected, when there are no
+            active tasks, when all tasks are done, or when every query
+            fails (a failing task warns and counts as not running).
+        """
+        if not self._connected:
+            return False
+
+        candidates: list[Any] = []
+        if self._task_in is not None:
+            candidates.append(self._task_in)
+        if self._task_out is not None:
+            candidates.append(self._task_out)
+        for digital in (self._task_digital_in, self._task_digital_out):
+            if digital is None:
+                continue
+            # DITask/DOTask wrappers expose the raw nidaqmx task as .task;
+            # tasks loaded from NI MAX name strings are raw already.
+            inner = getattr(digital, "task", None)
+            candidates.append(inner if inner is not None else digital)
+
+        running = False
+        for task in candidates:
+            try:
+                if not task.is_task_done():
+                    running = True
+            except DaqError as exc:
+                warnings.warn(
+                    f"is_task_done() failed — treating task as not "
+                    f"running: {exc}",
+                    stacklevel=2,
+                )
+        return running
 
     def get_device_info(self) -> dict:
         """Return device/task metadata.
