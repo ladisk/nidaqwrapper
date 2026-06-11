@@ -741,6 +741,208 @@ class TestChannelValidation:
 
 
 # ===========================================================================
+# fix-gh-issues-5-8: eager validation in add_channel() (issues #5, #6)
+# ===========================================================================
+
+class TestAddChannelEagerValidation:
+    """add_channel() configures timing and forces TASK_VERIFY after the add.
+
+    Fixes GH issues #5 (-201087 on delta-sigma/IEPE modules: subsequent
+    channel-attribute reads require configured timing) and #6 (deferred
+    property validation: errors must surface on the offending line).
+    """
+
+    def test_add_cfg_verify_called_in_order(self, mock_system, mock_constants):
+        """Call order is: add channel -> cfg_samp_clk_timing -> TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            order = []
+            orig_add = mt.ai_channels.add_ai_voltage_chan.side_effect
+
+            def _tracking_add(**kwargs):
+                order.append("add")
+                return orig_add(**kwargs)
+
+            mt.ai_channels.add_ai_voltage_chan.side_effect = _tracking_add
+            mt.timing.cfg_samp_clk_timing.side_effect = (
+                lambda *a, **kw: order.append("cfg")
+            )
+            mt.control.side_effect = lambda *a, **kw: order.append("verify")
+
+            task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0, units="V")
+
+        assert order == ["add", "cfg", "verify"]
+
+    def test_cfg_uses_stored_default_settings(self, mock_system, mock_constants):
+        """Eager timing config uses the stored defaults (continuous, onboard)."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=25600)
+        with ctx:
+            task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0, units="V")
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 25600
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert "samps_per_chan" not in kwargs
+        assert "source" not in kwargs
+
+    def test_verify_uses_task_verify_constant(self, mock_system, mock_constants):
+        """task.control() is called with TaskMode.TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0, units="V")
+
+        mt.control.assert_called_once_with(mock_constants.TaskMode.TASK_VERIFY)
+
+    def test_cfg_uses_stored_settings_after_configure(self, mock_system,
+                                                      mock_constants):
+        """A later add_channel() re-applies the task's CURRENT stored settings."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=25600)
+        with ctx:
+            task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0, units="V")
+            task.configure(sample_mode="finite", samples_per_channel=1000,
+                           clock_source="/cDAQ1Mod1/ai/SampleClock")
+            task.add_channel("v1", device="cDAQ1Mod1", channel_ind=1, units="V")
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 25600
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.FINITE
+        assert kwargs["samps_per_chan"] == 1000
+        assert kwargs["source"] == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_daqerror_from_cfg_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by cfg_samp_clk_timing propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.timing.cfg_samp_clk_timing.side_effect = DaqError(
+                "timing rejected", -201087
+            )
+            with pytest.raises(DaqError):
+                task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0,
+                                 units="V")
+
+    def test_daqerror_from_verify_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by TASK_VERIFY propagates unchanged (issue #6)."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.control.side_effect = DaqError("requested value not supported",
+                                              -200077)
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0,
+                                 units="V", min_val=-1e5, max_val=1e5)
+
+        assert exc_info.value.error_code == -200077
+
+    def test_no_rate_coercion_check_in_add_channel(self, mock_system,
+                                                   mock_constants):
+        """add_channel() does NOT raise on rate coercion (delta-sigma coerces
+        legally); the strict check stays in configure() only."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=25600, samp_clk_rate=25000)
+        with ctx:
+            task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0,
+                             units="V")  # no raise
+
+
+class TestAddChannelDuplicateGuard:
+    """The duplicate pre-check iteration is guarded against -201087 (issue #5)."""
+
+    def test_iteration_201087_warns_and_skips(self, mock_system, mock_constants):
+        """DaqError -201087 during iteration -> warning, pre-check skipped,
+        the channel is still added."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ai_channels.__iter__ = MagicMock(
+                side_effect=DaqError("on-demand not supported", -201087)
+            )
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0,
+                                 units="V")
+
+        assert any("pre-check" in str(x.message) for x in w)
+        mt.ai_channels.add_ai_voltage_chan.assert_called_once()
+
+    def test_iteration_other_daqerror_reraises(self, mock_system, mock_constants):
+        """Any other DaqError from the iteration is re-raised; no channel added."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ai_channels.__iter__ = MagicMock(
+                side_effect=DaqError("device gone", -50103)
+            )
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("v0", device="cDAQ1Mod1", channel_ind=0,
+                                 units="V")
+
+        assert exc_info.value.error_code == -50103
+        mt.ai_channels.add_ai_voltage_chan.assert_not_called()
+
+
+class TestFromTaskTimingGuard:
+    """from_task() tolerates untimed tasks on delta-sigma devices (issue #5)."""
+
+    def _make_external_task(self, rate_error=None):
+        from unittest.mock import PropertyMock
+
+        mock_ni_task = MagicMock()
+        mock_ni_task.name = "external_task"
+        mock_ch = MagicMock()
+        mock_ch.name = "ai0"
+        mock_ni_task.ai_channels = [mock_ch]
+        mock_ni_task.channel_names = ["ai0"]
+        mock_ni_task.is_task_done.return_value = True
+        if rate_error is not None:
+            type(mock_ni_task.timing).samp_clk_rate = PropertyMock(
+                side_effect=rate_error
+            )
+        else:
+            mock_ni_task.timing.samp_clk_rate = 25600
+        return mock_ni_task
+
+    def test_samp_clk_rate_201087_sets_none_and_warns(self, mock_system,
+                                                      mock_constants):
+        """DaqError -201087 reading samp_clk_rate -> sample_rate=None + warning."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            rate_error=DaqError("timing not configured", -201087)
+        )
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AITask.from_task(external)
+
+        assert task.sample_rate is None
+        assert any("sample rate" in str(x.message).lower() for x in w)
+
+    def test_samp_clk_rate_other_daqerror_propagates(self, mock_system,
+                                                     mock_constants):
+        """Any other DaqError reading samp_clk_rate propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            rate_error=DaqError("device gone", -50103)
+        )
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            with pytest.raises(DaqError) as exc_info:
+                AITask.from_task(external)
+
+        assert exc_info.value.error_code == -50103
+
+
+# ===========================================================================
 # Task Group 2: configure() — configures timing (formerly start())
 # ===========================================================================
 
@@ -755,6 +957,8 @@ class TestConfigure:
                 "accel_x", device="cDAQ1Mod1", channel_ind=0,
                 sensitivity=100.0, sensitivity_units="mV/g", units="g",
             )
+            # add_channel() applies timing eagerly; isolate configure()'s call
+            mt.timing.cfg_samp_clk_timing.reset_mock()
             task.configure()
 
         mt.timing.cfg_samp_clk_timing.assert_called_once()
@@ -2758,6 +2962,9 @@ class TestConfigureSyncExtensions:
             "accel_x", device="cDAQ1Mod1", channel_ind=0,
             sensitivity=100.0, sensitivity_units="mV/g", units="g",
         )
+        # add_channel() applies timing eagerly (fix-gh-issues-5-8); reset
+        # the timing mock so each test asserts configure()'s calls only.
+        task.task.timing.cfg_samp_clk_timing.reset_mock()
 
     def test_finite_mode_maps_to_enum(self, mock_system, mock_constants):
         """sample_mode='finite' maps to AcquisitionType.FINITE with samps_per_chan."""

@@ -22,6 +22,7 @@ from __future__ import annotations
 import pathlib
 import warnings
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 
@@ -31,10 +32,12 @@ from .utils import UNITS, UNITS_REVERSE, _require_nidaqmx
 try:
     import nidaqmx
     from nidaqmx import constants
+    from nidaqmx.errors import DaqError
 
     _NIDAQMX_AVAILABLE = True
 except ImportError:
     _NIDAQMX_AVAILABLE = False
+    DaqError = Exception  # type: ignore[misc,assignment]
 
 # String-to-enum-attribute mapping for analog trigger slopes, resolved
 # against the live ``constants`` namespace at call time.
@@ -177,6 +180,20 @@ class AITask(BaseTask):
         RuntimeError
             If this task was created via :meth:`from_task` (channels must
             be configured on the nidaqmx task before wrapping).
+        nidaqmx.errors.DaqError
+            If the driver rejects the channel configuration.  After the
+            channel is added, sample-clock timing is configured with the
+            task's current settings and the driver validates the whole
+            task (``TASK_VERIFY``), so invalid parameters (e.g. an
+            out-of-range *min_val*/*max_val*) raise here instead of at a
+            later operation.
+
+        Notes
+        -----
+        NI-DAQmx cannot remove channels from a task.  If ``add_channel()``
+        raises after the driver accepted the channel but validation
+        failed, the task still contains the invalid channel — recreate
+        the task (``clear_task()`` and build a new one) before retrying.
         """
         # -- Ownership check ------------------------------------------------
         if not self._owns_task:
@@ -202,14 +219,35 @@ class AITask(BaseTask):
         if not device or not isinstance(device, str):
             raise ValueError("device must be a non-empty string")
 
-        # Duplicate physical channel detection: iterate the live task channels
+        # Duplicate physical channel detection: iterate the live task channels.
+        # The driver (and TASK_VERIFY) ACCEPTS duplicate physical AI channels,
+        # so this pre-check is the only protection against silent
+        # double-sampling.  Iterating channel objects reads channel
+        # attributes, which triggers implicit task verification — on devices
+        # that reject on-demand timing (delta-sigma/IEPE) an untimed task
+        # raises DaqError -201087 here (GH issue #5).  Our own add path
+        # always leaves timing configured, so this guard only fires for
+        # externally-built untimed tasks wrapped with take_ownership=True.
         physical_channel = f"{device}/ai{channel_ind}"
-        for ch in self.task.ai_channels:
-            if ch.physical_channel.name == physical_channel:
-                raise ValueError(
-                    f"Physical channel ai{channel_ind} on device "
-                    f"'{device}' is already in use."
+        try:
+            for ch in self.task.ai_channels:
+                if ch.physical_channel.name == physical_channel:
+                    raise ValueError(
+                        f"Physical channel ai{channel_ind} on device "
+                        f"'{device}' is already in use."
+                    )
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -201087:
+                warnings.warn(
+                    "Duplicate-channel pre-check skipped: the task has no "
+                    "sample-clock timing configured and the device rejects "
+                    "on-demand timing (DaqError -201087). Ensure the "
+                    f"physical channel '{physical_channel}' is not already "
+                    "in the task.",
+                    stacklevel=2,
                 )
+            else:
+                raise
 
         # -- Scale type validation ------------------------------------------
         if scale is not None and not isinstance(scale, (int, float, tuple)):
@@ -314,6 +352,38 @@ class AITask(BaseTask):
                 options["units"] = resolved_units
             self.task.ai_channels.add_ai_voltage_chan(**options)
 
+        # -- Eager validation (GH issues #5, #6) -----------------------------
+        # Configure sample-clock timing with the task's current stored
+        # settings, then force driver validation.  Timing first: verifying
+        # an untimed task would itself raise -201087 on delta-sigma devices.
+        # Validation errors (e.g. -200077 out-of-range limits) surface here,
+        # on the offending add_channel() call, instead of at a later
+        # verification-forcing operation.  DaqErrors propagate unchanged.
+        self._apply_timing()
+        self.task.control(constants.TaskMode.TASK_VERIFY)
+
+    def _apply_timing(self) -> None:
+        """Apply the stored sample-clock timing settings to the live task.
+
+        Shared by :meth:`configure` and :meth:`add_channel` so the timing
+        call cannot diverge between the two paths.  Reads the stored
+        introspection attributes (``sample_rate``, ``sample_mode_str``,
+        ``samples_per_channel``, ``clock_source``).
+        """
+        acq_type = getattr(
+            constants.AcquisitionType, _SAMPLE_MODE_ATTR[self.sample_mode_str]
+        )
+
+        timing_kwargs: dict[str, Any] = {
+            "rate": self.sample_rate,
+            "sample_mode": acq_type,
+        }
+        if self.samples_per_channel is not None:
+            timing_kwargs["samps_per_chan"] = self.samples_per_channel
+        if self.clock_source is not None:
+            timing_kwargs["source"] = self.clock_source
+
+        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
     # -- Task lifecycle ------------------------------------------------------
 
@@ -391,26 +461,15 @@ class AITask(BaseTask):
                 f"got {clock_source!r}."
             )
 
-        acq_type = getattr(
+        # Store for introspection — the live task remains the source of truth
+        self.sample_mode = getattr(
             constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode]
         )
-
-        timing_kwargs: dict[str, Any] = {
-            "rate": self.sample_rate,
-            "sample_mode": acq_type,
-        }
-        if samples_per_channel is not None:
-            timing_kwargs["samps_per_chan"] = samples_per_channel
-        if clock_source is not None:
-            timing_kwargs["source"] = clock_source
-
-        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
-
-        # Store for introspection — the live task remains the source of truth
-        self.sample_mode = acq_type
         self.sample_mode_str = sample_mode
         self.samples_per_channel = samples_per_channel
         self.clock_source = clock_source
+
+        self._apply_timing()
 
         # Rate-coercion check applies only to the onboard clock: with an
         # external clock_source the reported rate is whatever the exported
@@ -820,7 +879,26 @@ class AITask(BaseTask):
 
         instance.task = task
         instance.task_name = task.name
-        instance.sample_rate = float(task.timing.samp_clk_rate)
+
+        # Reading samp_clk_rate forces implicit task verification; on an
+        # untimed task on a device that rejects on-demand timing
+        # (delta-sigma/IEPE) this raises DaqError -201087 (GH issue #5).
+        try:
+            instance.sample_rate = float(task.timing.samp_clk_rate)
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -201087:
+                instance.sample_rate = None
+                warnings.warn(
+                    "Could not read the sample rate from the task: no "
+                    "sample-clock timing is configured and the device "
+                    "rejects on-demand timing (DaqError -201087). "
+                    "sample_rate is set to None — call configure() after "
+                    "setting sample_rate, or configure timing on the "
+                    "nidaqmx task before wrapping.",
+                    stacklevel=2,
+                )
+            else:
+                raise
         instance.sample_mode = task.timing.samp_quant_samp_mode
 
         # Synchronized-acquisition attributes — derived from the live task;
