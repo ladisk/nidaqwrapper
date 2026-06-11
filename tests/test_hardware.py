@@ -682,3 +682,60 @@ class TestMultiHandlerHardware:
                 adv.disconnect()
         finally:
             task.clear_task()
+
+
+# ===========================================================================
+# fix-gh-issues-5-8: IEPE consecutive-add regression (GitHub issue #5)
+# ===========================================================================
+
+
+def _find_iepe_module() -> str | None:
+    """Return the name of the first connected IEPE-capable module, if any.
+
+    Issue #5 reproduces only on delta-sigma modules that reject on-demand
+    timing (e.g. NI 9234, cDAQ-9132-hosted modules); E/M/X-series devices
+    accept on-demand timing and never raised -201087.
+    """
+    from nidaqwrapper import list_devices
+
+    for dev in list_devices():
+        product_type = dev["product_type"]
+        if "9234" in product_type or "9132" in product_type:
+            return dev["name"]
+    return None
+
+
+class TestIEPEConsecutiveAdd:
+    """Issue #5: consecutive accel adds on a delta-sigma module.
+
+    Before fix-gh-issues-5-8, the second add_channel() raised DaqError
+    -201087: the duplicate-channel pre-check iterated live channel objects,
+    triggering implicit task verification on a task without configured
+    timing — which IEPE modules categorically reject.  add_channel() now
+    configures timing after every add, so the iteration is safe.
+    """
+
+    def test_two_accel_channels_consecutive_add(self) -> None:
+        """Two consecutive accel adds succeed; both channels are present."""
+        device = _find_iepe_module()
+        if device is None:
+            pytest.skip(
+                "No IEPE-capable module (NI 9234 / cDAQ-9132) connected"
+            )
+
+        from nidaqwrapper import AITask
+
+        task = AITask("test_issue5_iepe_adds", sample_rate=25600)
+        try:
+            task.add_channel(
+                "acc0", device=device, channel_ind=0,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            # This second add raised DaqError -201087 before the fix
+            task.add_channel(
+                "acc1", device=device, channel_ind=1,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            assert task.channel_list == ["acc0", "acc1"]
+        finally:
+            task.clear_task()
