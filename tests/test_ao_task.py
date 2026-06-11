@@ -549,6 +549,114 @@ class TestBaseTaskStart:
 
 
 # ===========================================================================
+# fix-gh-issues-5-8: save() and stop() — inherited from BaseTask (issue #7/#8)
+# ===========================================================================
+
+def _make_external_task_for_gate(mock_constants) -> MagicMock:
+    """Minimal external mock nidaqmx task for ownership-gate tests."""
+    task = MagicMock()
+    task.name = "external_task"
+    ch = MagicMock()
+    ch.name = "ao_0"
+    ch.physical_channel.name = "cDAQ1Mod1/ao0"
+    task.ao_channels = [ch]
+    task.channel_names = ["ao_0"]
+    task.timing.samp_clk_rate = 10000
+    task.timing.samp_quant_samp_per_chan = 50000
+    task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+class TestSave:
+    """AOTask.save() persists the task to NI MAX (BaseTask implementation)."""
+
+    def test_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        task.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_default_does_not_clear(self, mock_system, mock_constants):
+        """Shared BaseTask default is clear_task=False — task stays open."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        task.clear_task = MagicMock()
+
+        task.save()
+        task.clear_task.assert_not_called()
+        assert task.task is mt
+
+    def test_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        task.clear_task = MagicMock()
+
+        task.save(clear_task=True)
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+        task.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_task_for_gate(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                task.save()
+
+        external.save.assert_not_called()
+
+
+class TestStop:
+    """AOTask.stop() delegates to self.task.stop() (BaseTask implementation)."""
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop() on the nidaqmx task."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.stop.assert_called_once()
+
+    def test_stop_does_not_close_task(self, mock_system, mock_constants):
+        """stop() leaves the task handle open (unlike clear_task())."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.close.assert_not_called()
+        assert task.task is mt
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_task_for_gate(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                task.stop()
+
+        external.stop.assert_not_called()
+
+
+# ===========================================================================
 # Task Group 4.5: Getters — read from nidaqmx task
 # ===========================================================================
 

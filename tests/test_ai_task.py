@@ -1170,6 +1170,88 @@ class TestSave:
         task.save()
         mt.save.assert_called_once()
 
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False (fix-gh-issues-5-8).
+
+        An externally-provided task (from_task) is not owned by the wrapper,
+        so save() must refuse to persist it — the external caller controls
+        the task lifecycle and NI MAX persistence.
+        """
+        mock_ni_task = MagicMock()
+        mock_ni_task.name = "external_task"
+        mock_ni_task.timing.samp_clk_rate = 25600
+        mock_ch = MagicMock()
+        mock_ch.name = "ai0"
+        mock_ni_task.ai_channels = [mock_ch]
+        mock_ni_task.channel_names = ["ai0"]
+        mock_ni_task.is_task_done.return_value = True
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                task.save()
+
+        mock_ni_task.save.assert_not_called()
+
+
+# ===========================================================================
+# fix-gh-issues-5-8: stop() — BaseTask.stop() delegates to nidaqmx task.stop()
+# ===========================================================================
+
+class TestStop:
+    """stop() is inherited from BaseTask and delegates to self.task.stop()."""
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop() on the nidaqmx task."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel(
+                "accel_x", device="cDAQ1Mod1", channel_ind=0,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.stop.assert_called_once()
+
+    def test_stop_does_not_close_task(self, mock_system, mock_constants):
+        """stop() leaves the task handle open (unlike clear_task())."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel(
+                "accel_x", device="cDAQ1Mod1", channel_ind=0,
+                sensitivity=100.0, sensitivity_units="mV/g", units="g",
+            )
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.close.assert_not_called()
+        assert task.task is mt
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        mock_ni_task = MagicMock()
+        mock_ni_task.name = "external_task"
+        mock_ni_task.timing.samp_clk_rate = 25600
+        mock_ch = MagicMock()
+        mock_ch.name = "ai0"
+        mock_ni_task.ai_channels = [mock_ch]
+        mock_ni_task.channel_names = ["ai0"]
+        mock_ni_task.is_task_done.return_value = True
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            from nidaqwrapper.ai_task import AITask
+            task = AITask.from_task(mock_ni_task)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                task.stop()
+
+        mock_ni_task.stop.assert_not_called()
+
 
 # ===========================================================================
 # Existing: Context Manager

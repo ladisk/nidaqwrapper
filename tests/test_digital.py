@@ -2960,6 +2960,154 @@ def _make_external_digital_task(channel_attr: str) -> MagicMock:
     return task
 
 
+# ===========================================================================
+# fix-gh-issues-5-8: save() and stop() on DITask/DOTask (issues #7/#8)
+# ===========================================================================
+
+class TestDITaskSaveStop:
+    """DITask gains save() and stop() via BaseTask."""
+
+    def test_save_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+
+        di.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_save_default_does_not_clear(self, mock_system, mock_constants):
+        """Default clear_task=False — the task stays open after save()."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+        di.clear_task = MagicMock()
+
+        di.save()
+        di.clear_task.assert_not_called()
+        assert di.task is mt
+
+    def test_save_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+        di.clear_task = MagicMock()
+
+        di.save(clear_task=True)
+        di.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                di.save()
+
+        external.save.assert_not_called()
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop()."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+            di.configure()
+            di.start()
+            di.stop()
+
+        mt.stop.assert_called_once()
+        mt.close.assert_not_called()
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                di.stop()
+
+        external.stop.assert_not_called()
+
+
+class TestDOTaskSaveStop:
+    """DOTask gains save() and stop() via BaseTask."""
+
+    def test_save_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+
+        do.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_save_default_does_not_clear(self, mock_system, mock_constants):
+        """Default clear_task=False — the task stays open after save()."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+        do.clear_task = MagicMock()
+
+        do.save()
+        do.clear_task.assert_not_called()
+        assert do.task is mt
+
+    def test_save_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+        do.clear_task = MagicMock()
+
+        do.save(clear_task=True)
+        do.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                do.save()
+
+        external.save.assert_not_called()
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop()."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+            do.configure()
+            do.start()
+            do.stop()
+
+        mt.stop.assert_called_once()
+        mt.close.assert_not_called()
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                do.stop()
+
+        external.stop.assert_not_called()
+
+
 class TestDITaskSetStartTrigger:
     """set_start_trigger() configures a digital edge start trigger on DITask."""
 

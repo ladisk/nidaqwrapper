@@ -221,6 +221,59 @@ class BaseTask:
             )
         self.task.start()
 
+    def stop(self) -> None:
+        """Stop the hardware task.
+
+        Stops acquisition or generation on the underlying nidaqmx task
+        without releasing the task handle — call :meth:`start` to resume
+        or :meth:`clear_task` to release the hardware.  Stopping a task
+        that is not running is a no-op (driver semantics).
+
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — stop the nidaqmx.Task directly).
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot stop an externally-provided task. "
+                "Stop the nidaqmx.Task directly — the external caller "
+                "owns the task lifecycle."
+            )
+        self.task.stop()
+
+    def save(self, clear_task: bool = False) -> None:
+        """Save the task to NI MAX.
+
+        Persists the task definition (channels, timing) to NI MAX via
+        ``task.save(overwrite_existing_task=True)`` so it can be reloaded
+        later with :meth:`from_name`.
+
+        Parameters
+        ----------
+        clear_task : bool, optional
+            If ``True``, call :meth:`clear_task` after saving.  Default is
+            ``False`` (the task remains usable).  Note: :class:`AITask`
+            overrides this default to ``True`` for backward compatibility.
+
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — call ``task.save()`` directly).
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot save an externally-provided task. "
+                "Call task.save() on the nidaqmx.Task directly — the "
+                "external caller owns the task lifecycle."
+            )
+        self.task.save(overwrite_existing_task=True)
+
+        if clear_task:
+            self.clear_task()
+
     # -- Context manager -----------------------------------------------------
 
     def __enter__(self) -> BaseTask:

@@ -521,19 +521,22 @@ class AITask(BaseTask):
     def save(self, clear_task: bool = True) -> None:
         """Save the task to NI MAX.
 
-        The task always exists in the direct-delegation architecture, so
-        this method calls ``task.save()`` directly without auto-initiating.
-        After saving, optionally closes the task.
+        Thin override of :meth:`BaseTask.save` that keeps AITask's
+        historical default of clearing the task after saving.
 
         Parameters
         ----------
         clear_task : bool, optional
             If ``True`` (default), call :meth:`clear_task` after saving.
-        """
-        self.task.save(overwrite_existing_task=True)
+            Note: the shared :meth:`BaseTask.save` defaults to ``False``.
 
-        if clear_task:
-            self.clear_task()
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — call ``task.save()`` directly).
+        """
+        super().save(clear_task=clear_task)
 
     # -- TOML config persistence --------------------------------------------
 
