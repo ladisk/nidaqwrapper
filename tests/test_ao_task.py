@@ -44,6 +44,15 @@ def _make_mock_ni_task(samp_clk_rate: float = 10000) -> MagicMock:
     def _ao_handler(**kwargs):
         name = kwargs.get("name_to_assign_to_channel", "")
         phys = kwargs.get("physical_channel", "")
+        # Mimic the driver: duplicate physical AO channels are rejected
+        # natively at add time with DaqError -200371 (probed on SimDev1;
+        # fix-gh-issues-5-8 maps this to ValueError in add_channel()).
+        from nidaqmx.errors import DaqError
+        if any(c.physical_channel.name == phys for c in _channel_objects):
+            raise DaqError(
+                "Physical channel specified more than once in the task",
+                -200371,
+            )
         _channel_names.append(name)
         ch = MagicMock()
         ch.name = name
@@ -395,6 +404,226 @@ class TestAddChannel:
 
 
 # ===========================================================================
+# fix-gh-issues-5-8: eager validation + native duplicate mapping (issues #5, #6)
+# ===========================================================================
+
+class TestAddChannelEagerValidation:
+    """add_channel() configures timing and forces TASK_VERIFY after the add.
+
+    Fixes GH issue #6: deferred property validation (e.g. out-of-range
+    min/max, DaqError -200077) must surface inside the offending
+    add_channel() call, not at a later operation.
+    """
+
+    def test_add_cfg_verify_called_in_order(self, mock_system, mock_constants):
+        """Call order is: add channel -> cfg_samp_clk_timing -> TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            order = []
+            orig_add = mt.ao_channels.add_ao_voltage_chan.side_effect
+
+            def _tracking_add(**kwargs):
+                order.append("add")
+                return orig_add(**kwargs)
+
+            mt.ao_channels.add_ao_voltage_chan.side_effect = _tracking_add
+            mt.timing.cfg_samp_clk_timing.side_effect = (
+                lambda *a, **kw: order.append("cfg")
+            )
+            mt.control.side_effect = lambda *a, **kw: order.append("verify")
+
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert order == ["add", "cfg", "verify"]
+
+    def test_cfg_uses_stored_settings(self, mock_system, mock_constants):
+        """Eager timing config uses rate, CONTINUOUS, and the stored buffer size."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 10000
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == task.samples_per_channel
+        assert "source" not in kwargs
+
+    def test_verify_uses_task_verify_constant(self, mock_system, mock_constants):
+        """task.control() is called with TaskMode.TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        mt.control.assert_called_once_with(mock_constants.TaskMode.TASK_VERIFY)
+
+    def test_cfg_uses_clock_source_after_configure(self, mock_system,
+                                                   mock_constants):
+        """A later add_channel() re-applies the stored external clock source."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+            task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=1)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["source"] == "/Dev1/ai/SampleClock"
+
+    def test_daqerror_from_verify_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by TASK_VERIFY propagates unchanged (issue #6)."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.control.side_effect = DaqError(
+                "requested value is not a supported value", -200077
+            )
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0,
+                                 min_val=-1e5, max_val=1e5)
+
+        assert exc_info.value.error_code == -200077
+
+    def test_daqerror_from_cfg_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by cfg_samp_clk_timing propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.timing.cfg_samp_clk_timing.side_effect = DaqError(
+                "timing rejected", -201087
+            )
+            with pytest.raises(DaqError):
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+    def test_no_rate_coercion_check_in_add_channel(self, mock_system,
+                                                   mock_constants):
+        """add_channel() does NOT raise on rate coercion; configure() does."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=10240)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)  # no raise
+
+    def test_regen_mode_not_set_by_add_channel(self, mock_system, mock_constants):
+        """Regeneration mode stays a configure() concern (not set per add)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert (mt._out_stream.regen_mode
+                is not mock_constants.RegenerationMode.ALLOW_REGENERATION)
+
+
+class TestAddChannelDuplicateMapping:
+    """Duplicate detection delegates to the driver (-200371 -> ValueError)."""
+
+    def test_duplicate_maps_to_valueerror_chained(self, mock_system,
+                                                  mock_constants):
+        """DaqError -200371 from the driver maps to ValueError chained from it."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            with pytest.raises(ValueError, match="already in use") as exc_info:
+                task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=0)
+
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, DaqError)
+        assert cause.error_code == -200371
+
+    def test_other_daqerror_from_add_propagates(self, mock_system,
+                                                mock_constants):
+        """Any other DaqError from add_ao_voltage_chan propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ao_channels.add_ao_voltage_chan.side_effect = DaqError(
+                "device unavailable", -50103
+            )
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert exc_info.value.error_code == -50103
+
+    def test_no_channel_iteration_in_add_channel(self, mock_system,
+                                                 mock_constants):
+        """add_channel() never iterates ao_channels (issue #5 regression):
+        adds succeed even when iterating would raise -201087."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ao_channels.__iter__ = MagicMock(
+                side_effect=DaqError("on-demand not supported", -201087)
+            )
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=1)
+
+        assert mt.ao_channels.add_ao_voltage_chan.call_count == 2
+
+
+class TestFromTaskTimingGuard:
+    """from_task() tolerates untimed tasks on delta-sigma devices (issue #5)."""
+
+    def _make_external_task(self, mock_constants, rate_error=None):
+        from unittest.mock import PropertyMock
+
+        task = MagicMock()
+        task.name = "external_task"
+        ch = MagicMock()
+        ch.name = "ao_0"
+        ch.physical_channel.name = "cDAQ1Mod1/ao0"
+        task.ao_channels = [ch]
+        task.channel_names = ["ao_0"]
+        task.timing.samp_quant_samp_per_chan = 50000
+        task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+        task.is_task_done = MagicMock(return_value=True)
+        if rate_error is not None:
+            type(task.timing).samp_clk_rate = PropertyMock(
+                side_effect=rate_error
+            )
+        else:
+            task.timing.samp_clk_rate = 10000
+        return task
+
+    def test_samp_clk_rate_201087_sets_none_and_warns(self, mock_system,
+                                                      mock_constants):
+        """DaqError -201087 reading samp_clk_rate -> sample_rate=None + warning."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants, rate_error=DaqError("timing not configured", -201087)
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate is None
+        assert any("sample rate" in str(x.message).lower() for x in w)
+
+    def test_samp_clk_rate_other_daqerror_propagates(self, mock_system,
+                                                     mock_constants):
+        """Any other DaqError reading samp_clk_rate propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants, rate_error=DaqError("device gone", -50103)
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with pytest.raises(DaqError) as exc_info:
+                AOTask.from_task(external)
+
+        assert exc_info.value.error_code == -50103
+
+
+# ===========================================================================
 # Task Group 4.4: configure() — sets timing and regeneration mode
 # ===========================================================================
 
@@ -406,6 +635,8 @@ class TestConfigure:
         ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
         with ctx:
             task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            # add_channel() applies timing eagerly; isolate configure()'s call
+            mt.timing.cfg_samp_clk_timing.reset_mock()
             task.configure()
 
         mt.timing.cfg_samp_clk_timing.assert_called_once()
@@ -499,6 +730,8 @@ class TestConfigure:
         ctx, task, mt = _build(mock_system, mock_constants)
         with ctx:
             task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            # add_channel() applies timing eagerly; isolate configure()'s call
+            mt.timing.cfg_samp_clk_timing.reset_mock()
             task.configure()
             task.start()
 
@@ -2042,6 +2275,9 @@ class TestConfigureClockSource:
 
     def _add_channel(self, task):
         task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        # add_channel() applies timing eagerly (fix-gh-issues-5-8); reset
+        # the timing mock so each test asserts configure()'s calls only.
+        task.task.timing.cfg_samp_clk_timing.reset_mock()
 
     def test_clock_source_passed_as_source(self, mock_system, mock_constants):
         """A non-empty clock_source is forwarded as source= to cfg_samp_clk_timing."""
