@@ -6,9 +6,9 @@ nidaqwrapper uses a three-tier test strategy to balance speed, coverage, and har
 
 | Tier | Tests | Requirements | Purpose |
 |------|-------|-------------|---------|
-| **Mocked** | 858 | None | Fast unit tests with mocked nidaqmx for CI/CD |
-| **Simulated** | 77 + 1 xfail (+1 env-dependent skip) | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
-| **Hardware** | 32 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
+| **Mocked** | 905 | None | Fast unit tests with mocked nidaqmx for CI/CD |
+| **Simulated** | 81 + 1 xfail (+1 env-dependent skip) | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
+| **Hardware** | 33 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
 
 The simulated tier bridges the gap between mocked tests and hardware tests. All 4 bugs found during hardware testing were invisible to mocked tests because `MagicMock` auto-generates any attribute on access, masking real API mismatches. Simulated devices use the real NI-DAQmx driver with simulated hardware, catching API contract violations while remaining fast and deterministic.
 
@@ -35,7 +35,7 @@ The default `uv run pytest` excludes both simulated and hardware tests to ensure
 
 ## Test Tiers
 
-### Mocked Tests (858 tests)
+### Mocked Tests (905 tests)
 
 **What they test:**
 - Public API contracts (function signatures, return types)
@@ -95,7 +95,7 @@ Simulated tests detect these issues without requiring physical hardware.
   (DaqError -89125) — full cross-device bursts are hardware-test only
 - cDAQ chassis/modules cannot be simulated on Linux
 
-### Hardware Tests (32 tests)
+### Hardware Tests (33 tests)
 
 **What they test:**
 - Real-world timing accuracy and buffer fill rates
