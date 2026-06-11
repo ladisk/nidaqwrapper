@@ -110,6 +110,7 @@ class TestSaveRoundTripSimulated:
         # Defensive cleanup of leftovers from earlier aborted runs
         self._delete_persisted_task(self.TASK_NAME)
 
+        task = None
         loaded = None
         try:
             task = AITask(self.TASK_NAME, sample_rate=10000)
@@ -128,6 +129,11 @@ class TestSaveRoundTripSimulated:
             data = loaded.acquire(n_samples=500)
             assert data.shape == (500, 1)
         finally:
+            if task is not None:
+                try:
+                    task.clear_task()
+                except Exception:
+                    pass
             if loaded is not None:
                 try:
                     loaded.clear_task()

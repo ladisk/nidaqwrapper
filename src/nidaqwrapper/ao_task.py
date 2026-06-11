@@ -55,6 +55,10 @@ except ImportError:
 
 from .base_task import BaseTask
 
+# Sentinel for _apply_timing() parameters — distinguishes "not passed,
+# use the stored attribute" from an explicit ``None`` candidate value.
+_UNSET: Any = object()
+
 
 class AOTask(BaseTask):
     """Programmatic analog output task for NI-DAQmx devices.
@@ -227,21 +231,39 @@ class AOTask(BaseTask):
         self._apply_timing()
         self.task.control(constants.TaskMode.TASK_VERIFY)
 
-    def _apply_timing(self) -> None:
-        """Apply the stored sample-clock timing settings to the live task.
+    def _apply_timing(self, clock_source: Any = _UNSET) -> None:
+        """Apply sample-clock timing settings to the live task.
 
         Shared by :meth:`configure` and :meth:`add_channel` so the timing
         call cannot diverge between the two paths.  Reads the stored
-        attributes (``sample_rate``, ``samples_per_channel``,
-        ``clock_source``); AO output is always continuous.
+        attributes (``sample_rate``, ``samples_per_channel``); AO output
+        is always continuous.  *clock_source* defaults to the stored
+        attribute; :meth:`configure` passes the candidate value explicitly
+        so that nothing is persisted unless the driver accepts the timing.
+
+        Raises
+        ------
+        RuntimeError
+            If ``sample_rate`` is ``None`` (the task was wrapped via
+            :meth:`from_task` without timing configuration).
         """
+        if self.sample_rate is None:
+            raise RuntimeError(
+                "sample_rate is not set (task was wrapped without timing "
+                "configuration); set sample_rate and call configure() "
+                "before adding channels."
+            )
+
+        if clock_source is _UNSET:
+            clock_source = self.clock_source
+
         timing_kwargs: dict[str, Any] = {
             "rate": self.sample_rate,
             "sample_mode": constants.AcquisitionType.CONTINUOUS,
             "samps_per_chan": self.samples_per_channel,
         }
-        if self.clock_source is not None:
-            timing_kwargs["source"] = self.clock_source
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
 
         self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
@@ -286,10 +308,12 @@ class AOTask(BaseTask):
                 f"(e.g. '/Dev1/ai/SampleClock') or None, got {clock_source!r}."
             )
 
-        # Store for introspection — the live task remains the source of truth
+        # Apply timing with the candidate clock source; persist it for
+        # introspection only after the driver accepts the configuration.
+        # A rejected cfg call must not leave stored state diverging from
+        # the live task — add_channel() would replay rejected settings.
+        self._apply_timing(clock_source=clock_source)
         self.clock_source = clock_source
-
-        self._apply_timing()
 
         self.task._out_stream.regen_mode = constants.RegenerationMode.ALLOW_REGENERATION
 
@@ -573,39 +597,48 @@ class AOTask(BaseTask):
         instance.task = task
         instance.task_name = task.name
 
-        # Reading samp_clk_rate forces implicit task verification; on an
-        # untimed task on a device that rejects on-demand timing
-        # (delta-sigma) this raises DaqError -201087 (GH issue #5).
+        # Timing attributes — single consolidated guard.  Reading ANY
+        # timing property forces implicit task verification; on an untimed
+        # task on a device that rejects on-demand timing (delta-sigma)
+        # every such read raises DaqError -201087 (GH issue #5), so all
+        # timing reads live in this one block.  -201087 → one warning +
+        # safe defaults mirroring __init__; other DaqErrors propagate.
         try:
             instance.sample_rate = task.timing.samp_clk_rate
+            instance.samples_per_channel = task.timing.samp_quant_samp_per_chan
+            instance.sample_mode = task.timing.samp_quant_samp_mode
+
+            # External clock terminal — secondary read failures fall back
+            # to the safe default (None) with a warning.
+            instance.clock_source = None
+            try:
+                clk_src = task.timing.samp_clk_src
+                instance.clock_source = clk_src if clk_src else None
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read sample clock source from task: {exc}",
+                    stacklevel=2,
+                )
         except DaqError as exc:
             if getattr(exc, "error_code", None) == -201087:
                 instance.sample_rate = None
+                instance.samples_per_channel = None
+                instance.sample_mode = constants.AcquisitionType.CONTINUOUS
+                instance.clock_source = None
                 warnings.warn(
-                    "Could not read the sample rate from the task: no "
-                    "sample-clock timing is configured and the device "
-                    "rejects on-demand timing (DaqError -201087). "
-                    "sample_rate is set to None — call configure() after "
-                    "setting sample_rate, or configure timing on the "
-                    "nidaqmx task before wrapping.",
+                    "Could not read the timing configuration from the "
+                    "task: no sample-clock timing is configured and the "
+                    "device rejects on-demand timing (DaqError -201087). "
+                    "The sample rate is set to None and the remaining "
+                    "timing attributes to their defaults — call "
+                    "configure() after setting sample_rate, or configure "
+                    "timing on the nidaqmx task before wrapping.",
                     stacklevel=2,
                 )
             else:
                 raise
-        instance.samples_per_channel = task.timing.samp_quant_samp_per_chan
-        instance.sample_mode = task.timing.samp_quant_samp_mode
-
-        # External clock terminal — derived from the live task; failures
-        # fall back to the safe default (None) with a warning.
-        instance.clock_source = None
-        try:
-            clk_src = task.timing.samp_clk_src
-            instance.clock_source = clk_src if clk_src else None
-        except Exception as exc:
-            warnings.warn(
-                f"Could not read sample clock source from task: {exc}",
-                stacklevel=2,
-            )
 
         # Derive device info from the task itself
         instance.device_list = [dev.name for dev in task.devices]

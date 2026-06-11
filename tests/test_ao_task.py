@@ -567,7 +567,18 @@ class TestAddChannelDuplicateMapping:
 class TestFromTaskTimingGuard:
     """from_task() tolerates untimed tasks on delta-sigma devices (issue #5)."""
 
-    def _make_external_task(self, mock_constants, rate_error=None):
+    # All timing attributes from_task() reads — on a real untimed
+    # delta-sigma task, EVERY one of these raises -201087 (implicit
+    # verification), so the mock must raise from all of them.
+    _TIMING_ATTRS = (
+        "samp_clk_rate",
+        "samp_quant_samp_per_chan",
+        "samp_quant_samp_mode",
+        "samp_clk_src",
+    )
+
+    def _make_external_task(self, mock_constants, rate_error=None,
+                            timing_error=None):
         from unittest.mock import PropertyMock
 
         task = MagicMock()
@@ -577,16 +588,52 @@ class TestFromTaskTimingGuard:
         ch.physical_channel.name = "cDAQ1Mod1/ao0"
         task.ao_channels = [ch]
         task.channel_names = ["ao_0"]
-        task.timing.samp_quant_samp_per_chan = 50000
-        task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
         task.is_task_done = MagicMock(return_value=True)
-        if rate_error is not None:
-            type(task.timing).samp_clk_rate = PropertyMock(
-                side_effect=rate_error
-            )
+        if timing_error is not None:
+            # ALL timing reads raise (real untimed delta-sigma behavior)
+            for attr in self._TIMING_ATTRS:
+                setattr(
+                    type(task.timing), attr,
+                    PropertyMock(side_effect=timing_error),
+                )
         else:
-            task.timing.samp_clk_rate = 10000
+            task.timing.samp_quant_samp_per_chan = 50000
+            task.timing.samp_quant_samp_mode = (
+                mock_constants.AcquisitionType.CONTINUOUS
+            )
+            task.timing.samp_clk_src = ""
+            if rate_error is not None:
+                type(task.timing).samp_clk_rate = PropertyMock(
+                    side_effect=rate_error
+                )
+            else:
+                task.timing.samp_clk_rate = 10000
         return task
+
+    def test_all_timing_reads_201087_safe_defaults_single_warning(
+            self, mock_system, mock_constants):
+        """All timing reads raising -201087 -> wrapper created with safe
+        defaults (mirroring __init__) and exactly one warning."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants,
+            timing_error=DaqError("timing not configured", -201087),
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate is None
+        assert task.samples_per_channel is None
+        assert task.sample_mode == mock_constants.AcquisitionType.CONTINUOUS
+        assert task.clock_source is None
+        assert len(w) == 1
+        assert "sample rate" in str(w[0].message).lower()
+        assert "-201087" in str(w[0].message)
 
     def test_samp_clk_rate_201087_sets_none_and_warns(self, mock_system,
                                                       mock_constants):
@@ -604,6 +651,8 @@ class TestFromTaskTimingGuard:
                 task = AOTask.from_task(external)
 
         assert task.sample_rate is None
+        assert task.samples_per_channel is None
+        assert task.clock_source is None
         assert any("sample rate" in str(x.message).lower() for x in w)
 
     def test_samp_clk_rate_other_daqerror_propagates(self, mock_system,
@@ -621,6 +670,75 @@ class TestFromTaskTimingGuard:
                 AOTask.from_task(external)
 
         assert exc_info.value.error_code == -50103
+
+    def test_normal_task_timing_reads_unchanged_no_warning(self, mock_system,
+                                                           mock_constants):
+        """A normally-timed task is read without warnings; values intact."""
+        external = self._make_external_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate == 10000
+        assert task.samples_per_channel == 50000
+        assert task.sample_mode == mock_constants.AcquisitionType.CONTINUOUS
+        assert task.clock_source is None
+        assert len(w) == 0
+
+
+class TestApplyTimingSampleRateGuard:
+    """_apply_timing() refuses to run with sample_rate=None (review F2)."""
+
+    def test_sample_rate_none_raises_runtime_error(self, mock_system,
+                                                   mock_constants):
+        """sample_rate=None -> explicit RuntimeError, not an opaque
+        ctypes error from cfg_samp_clk_timing(rate=None)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.sample_rate = None
+            with pytest.raises(RuntimeError, match="sample_rate is not set"):
+                task._apply_timing()
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+
+class TestConfigureStateConsistency:
+    """configure() persists clock_source only after the driver accepts
+    the timing (review F3)."""
+
+    def test_rejected_timing_leaves_stored_state_unchanged(self, mock_system,
+                                                           mock_constants):
+        """cfg_samp_clk_timing raising in configure() -> stored
+        clock_source keeps its prior value (add_channel() must not
+        replay rejected settings)."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            assert task.clock_source is None
+
+            mt.timing.cfg_samp_clk_timing.side_effect = DaqError(
+                "timing rejected", -200077
+            )
+            with pytest.raises(DaqError):
+                task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source is None
+
+    def test_accepted_timing_persists_new_state(self, mock_system,
+                                                mock_constants):
+        """When the driver accepts the timing, configure() stores the
+        new clock_source (unchanged behavior)."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source == "/Dev1/ai/SampleClock"
 
 
 # ===========================================================================

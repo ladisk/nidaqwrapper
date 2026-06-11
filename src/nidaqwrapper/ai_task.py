@@ -43,6 +43,10 @@ except ImportError:
 # against the live ``constants`` namespace at call time.
 _SLOPE_ATTR: dict[str, str] = {"rising": "RISING", "falling": "FALLING"}
 
+# Sentinel for _apply_timing() parameters — distinguishes "not passed,
+# use the stored attribute" from an explicit ``None`` candidate value.
+_UNSET: Any = object()
+
 
 class AITask(BaseTask):
     """Programmatic analog input task for NI-DAQmx devices.
@@ -362,26 +366,53 @@ class AITask(BaseTask):
         self._apply_timing()
         self.task.control(constants.TaskMode.TASK_VERIFY)
 
-    def _apply_timing(self) -> None:
-        """Apply the stored sample-clock timing settings to the live task.
+    def _apply_timing(
+        self,
+        sample_mode_str: Any = _UNSET,
+        samples_per_channel: Any = _UNSET,
+        clock_source: Any = _UNSET,
+    ) -> None:
+        """Apply sample-clock timing settings to the live task.
 
         Shared by :meth:`configure` and :meth:`add_channel` so the timing
-        call cannot diverge between the two paths.  Reads the stored
-        introspection attributes (``sample_rate``, ``sample_mode_str``,
-        ``samples_per_channel``, ``clock_source``).
+        call cannot diverge between the two paths.  Parameters default to
+        the stored introspection attributes (``sample_mode_str``,
+        ``samples_per_channel``, ``clock_source``); :meth:`configure`
+        passes candidate values explicitly so that nothing is persisted
+        unless the driver accepts the timing.
+
+        Raises
+        ------
+        RuntimeError
+            If ``sample_rate`` is ``None`` (the task was wrapped via
+            :meth:`from_task` without timing configuration).
         """
+        if self.sample_rate is None:
+            raise RuntimeError(
+                "sample_rate is not set (task was wrapped without timing "
+                "configuration); set sample_rate and call configure() "
+                "before adding channels."
+            )
+
+        if sample_mode_str is _UNSET:
+            sample_mode_str = self.sample_mode_str
+        if samples_per_channel is _UNSET:
+            samples_per_channel = self.samples_per_channel
+        if clock_source is _UNSET:
+            clock_source = self.clock_source
+
         acq_type = getattr(
-            constants.AcquisitionType, _SAMPLE_MODE_ATTR[self.sample_mode_str]
+            constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode_str]
         )
 
         timing_kwargs: dict[str, Any] = {
             "rate": self.sample_rate,
             "sample_mode": acq_type,
         }
-        if self.samples_per_channel is not None:
-            timing_kwargs["samps_per_chan"] = self.samples_per_channel
-        if self.clock_source is not None:
-            timing_kwargs["source"] = self.clock_source
+        if samples_per_channel is not None:
+            timing_kwargs["samps_per_chan"] = samples_per_channel
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
 
         self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
@@ -461,15 +492,21 @@ class AITask(BaseTask):
                 f"got {clock_source!r}."
             )
 
-        # Store for introspection — the live task remains the source of truth
+        # Apply timing with the candidate settings; persist them for
+        # introspection only after the driver accepts the configuration.
+        # A rejected cfg call must not leave stored state diverging from
+        # the live task — add_channel() would replay rejected settings.
+        self._apply_timing(
+            sample_mode_str=sample_mode,
+            samples_per_channel=samples_per_channel,
+            clock_source=clock_source,
+        )
         self.sample_mode = getattr(
             constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode]
         )
         self.sample_mode_str = sample_mode
         self.samples_per_channel = samples_per_channel
         self.clock_source = clock_source
-
-        self._apply_timing()
 
         # Rate-coercion check applies only to the onboard clock: with an
         # external clock_source the reported rate is whatever the exported
@@ -880,51 +917,64 @@ class AITask(BaseTask):
         instance.task = task
         instance.task_name = task.name
 
-        # Reading samp_clk_rate forces implicit task verification; on an
-        # untimed task on a device that rejects on-demand timing
-        # (delta-sigma/IEPE) this raises DaqError -201087 (GH issue #5).
+        # Timing attributes — single consolidated guard.  Reading ANY
+        # timing property forces implicit task verification; on an untimed
+        # task on a device that rejects on-demand timing (delta-sigma/IEPE)
+        # every such read raises DaqError -201087 (GH issue #5), so all
+        # timing reads live in this one block.  -201087 → one warning +
+        # safe defaults mirroring __init__; other DaqErrors propagate.
         try:
             instance.sample_rate = float(task.timing.samp_clk_rate)
+            instance.sample_mode = task.timing.samp_quant_samp_mode
+
+            # Synchronized-acquisition attributes — secondary read
+            # failures fall back to safe defaults with a warning.
+            instance.sample_mode_str = "continuous"
+            instance.samples_per_channel = None
+            instance.clock_source = None
+            try:
+                if instance.sample_mode == constants.AcquisitionType.FINITE:
+                    instance.sample_mode_str = "finite"
+                    instance.samples_per_channel = int(
+                        task.timing.samp_quant_samp_per_chan
+                    )
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read finite samples_per_channel from "
+                    f"task: {exc}",
+                    stacklevel=2,
+                )
+            try:
+                clk_src = task.timing.samp_clk_src
+                instance.clock_source = clk_src if clk_src else None
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read sample clock source from task: {exc}",
+                    stacklevel=2,
+                )
         except DaqError as exc:
             if getattr(exc, "error_code", None) == -201087:
                 instance.sample_rate = None
+                instance.sample_mode = constants.AcquisitionType.CONTINUOUS
+                instance.sample_mode_str = "continuous"
+                instance.samples_per_channel = None
+                instance.clock_source = None
                 warnings.warn(
-                    "Could not read the sample rate from the task: no "
-                    "sample-clock timing is configured and the device "
-                    "rejects on-demand timing (DaqError -201087). "
-                    "sample_rate is set to None — call configure() after "
-                    "setting sample_rate, or configure timing on the "
-                    "nidaqmx task before wrapping.",
+                    "Could not read the timing configuration from the "
+                    "task: no sample-clock timing is configured and the "
+                    "device rejects on-demand timing (DaqError -201087). "
+                    "The sample rate is set to None and the remaining "
+                    "timing attributes to their defaults — call "
+                    "configure() after setting sample_rate, or configure "
+                    "timing on the nidaqmx task before wrapping.",
                     stacklevel=2,
                 )
             else:
                 raise
-        instance.sample_mode = task.timing.samp_quant_samp_mode
-
-        # Synchronized-acquisition attributes — derived from the live task;
-        # failures fall back to safe defaults with a warning.
-        instance.sample_mode_str = "continuous"
-        instance.samples_per_channel = None
-        instance.clock_source = None
-        try:
-            if instance.sample_mode == constants.AcquisitionType.FINITE:
-                instance.sample_mode_str = "finite"
-                instance.samples_per_channel = int(
-                    task.timing.samp_quant_samp_per_chan
-                )
-        except Exception as exc:
-            warnings.warn(
-                f"Could not read finite samples_per_channel from task: {exc}",
-                stacklevel=2,
-            )
-        try:
-            clk_src = task.timing.samp_clk_src
-            instance.clock_source = clk_src if clk_src else None
-        except Exception as exc:
-            warnings.warn(
-                f"Could not read sample clock source from task: {exc}",
-                stacklevel=2,
-            )
 
         # Ownership flag: controls whether mutating methods are permitted
         # and whether clear_task() closes the underlying nidaqmx task.
