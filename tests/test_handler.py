@@ -187,9 +187,16 @@ def wrapper_module():
     mock_nidaqmx.constants.READ_ALL_AVAILABLE = -1
     mock_nidaqmx.constants.AcquisitionType.CONTINUOUS = "CONTINUOUS"
 
+    # Real exception class so `from nidaqmx.errors import DaqError` yields
+    # something usable in `except` clauses (a MagicMock would raise
+    # "catching classes that do not inherit from BaseException").
+    mock_nidaqmx.errors.DaqError = type("DaqError", (Exception,), {})
+
     for mod_name in _MOCK_TARGETS:
         if mod_name == "nidaqmx":
             sys.modules[mod_name] = mock_nidaqmx
+        elif mod_name == "nidaqmx.errors":
+            sys.modules[mod_name] = mock_nidaqmx.errors
         elif mod_name == "pyTrigger":
             sys.modules[mod_name] = MagicMock()
         else:
@@ -2490,3 +2497,199 @@ class TestConfigureRawTask:
         # AO task stored as string
         assert w._task_out_name == "OutputTaskString"
         assert w._task_out_is_str is True
+
+
+# ===================================================================
+# Change multi-handler-advanced-acquisition
+# DAQHandler: is_running() and stop_acquisition()
+# ===================================================================
+
+class TestIsRunning:
+    """Group 4 — DAQHandler.is_running()."""
+
+    def test_not_connected_returns_false(self, DAQHandler):
+        """is_running() returns False when not connected."""
+        w = DAQHandler()
+        w.configure(task_in="InputTask")
+        assert w.is_running() is False
+
+    def test_no_tasks_returns_false(self, DAQHandler):
+        """is_running() returns False when connected but no active tasks."""
+        w = DAQHandler()
+        w.configure(task_in="InputTask")
+        w._connected = True
+        assert w.is_running() is False
+
+    def test_input_task_running_returns_true(self, DAQHandler):
+        """Running analog input task → True."""
+        w = DAQHandler()
+        w.configure(task_in="InputTask")
+        w._connected = True
+        mock_task = MagicMock()
+        mock_task.is_task_done.return_value = False
+        w._task_in = mock_task
+        assert w.is_running() is True
+
+    def test_output_task_running_returns_true(self, DAQHandler):
+        """Running analog output task → True."""
+        w = DAQHandler()
+        w.configure(task_out="OutputTask")
+        w._connected = True
+        mock_task = MagicMock()
+        mock_task.is_task_done.return_value = False
+        w._task_out = mock_task
+        assert w.is_running() is True
+
+    def test_all_tasks_done_returns_false(self, DAQHandler):
+        """All tasks report done → False."""
+        w = DAQHandler()
+        w.configure(task_in="In", task_out="Out")
+        w._connected = True
+        done_in = MagicMock()
+        done_in.is_task_done.return_value = True
+        done_out = MagicMock()
+        done_out.is_task_done.return_value = True
+        w._task_in = done_in
+        w._task_out = done_out
+        assert w.is_running() is False
+
+    def test_digital_task_running_returns_true(self, DAQHandler):
+        """Running digital input task (DITask wrapper) → True."""
+        w = DAQHandler()
+        w.configure(task_digital_in="DigInTask")
+        w._connected = True
+        # Active digital task is a DITask wrapper exposing .task
+        fake = _make_mock_digital_input()
+        fake.task = MagicMock()
+        fake.task.is_task_done.return_value = False
+        w._task_digital_in = fake
+        assert w.is_running() is True
+
+    def test_daqerror_warns_and_returns_false(self, DAQHandler, wrapper_module):
+        """DaqError during query → warning, task treated as not running."""
+        w = DAQHandler()
+        w.configure(task_in="InputTask")
+        w._connected = True
+        mock_task = MagicMock()
+        mock_task.is_task_done.side_effect = wrapper_module.DaqError("task gone")
+        w._task_in = mock_task
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = w.is_running()
+
+        assert result is False
+        assert any("task gone" in str(x.message) for x in caught)
+
+    def test_daqerror_on_one_task_other_running_returns_true(
+        self, DAQHandler, wrapper_module
+    ):
+        """DaqError on one task does not hide another running task."""
+        w = DAQHandler()
+        w.configure(task_in="In", task_out="Out")
+        w._connected = True
+        broken = MagicMock()
+        broken.is_task_done.side_effect = wrapper_module.DaqError("invalid")
+        running = MagicMock()
+        running.is_task_done.return_value = False
+        w._task_in = broken
+        w._task_out = running
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            assert w.is_running() is True
+
+
+class TestStopAcquisition:
+    """Group 4 — DAQHandler.stop_acquisition() cooperative abort."""
+
+    def _setup_never_finishing(self, DAQHandler):
+        """Set up a handler whose trigger never fires."""
+        w = DAQHandler()
+        w.configure(task_in="InputTask")
+        w._connected = True
+        w._connect_called = True
+        w._n_channels_in = 2
+        w._channel_names_in = ["ch0", "ch1"]
+        w._sample_rate_in = 25600.0
+        w.acquisition_sleep = 0.001
+        w.post_trigger_delay = 0
+
+        read_started = threading.Event()
+        mock_task = MagicMock()
+
+        def read_side_effect(*args, **kwargs):
+            read_started.set()
+            return [[0.0] * 10, [0.0] * 10]
+
+        mock_task.read.side_effect = read_side_effect
+        w._task_in = mock_task
+
+        mock_trigger = MagicMock()
+        mock_trigger.finished = False  # never fires
+        mock_trigger.rows = 100
+        ring = np.arange(200, dtype=float).reshape(100, 2)
+        mock_trigger.get_data.return_value = ring
+        w.trigger = mock_trigger
+        w._trigger_is_set = True
+
+        return w, mock_task, mock_trigger, ring, read_started
+
+    def test_noop_when_idle(self, DAQHandler):
+        """stop_acquisition() with no acquisition in flight is a no-op."""
+        w = DAQHandler()
+        w.stop_acquisition()  # must not raise
+        assert w._acquire_running is False
+
+    def test_stop_acquisition_does_not_take_lock(self, DAQHandler):
+        """stop_acquisition() must not block on the RLock (deadlock avoidance)."""
+        w = DAQHandler()
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with w._lock:
+                locked.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert locked.wait(timeout=5)
+
+        w._acquire_running = True
+        stopper = threading.Thread(target=w.stop_acquisition)
+        stopper.start()
+        stopper.join(timeout=1.0)
+        still_blocked = stopper.is_alive()
+        release.set()
+        holder.join(timeout=5)
+        stopper.join(timeout=5)
+
+        assert not still_blocked, "stop_acquisition() blocked on the RLock"
+        assert w._acquire_running is False
+
+    def test_abort_nonblocking_acquire(self, DAQHandler):
+        """Abort: loop exits, task stopped, Future resolves with ring buffer."""
+        w, mock_task, _, ring, read_started = self._setup_never_finishing(DAQHandler)
+
+        future = w.acquire(blocking=False)
+        assert read_started.wait(timeout=5), "acquisition loop never started"
+        w.stop_acquisition()
+        result = future.result(timeout=5)
+
+        mock_task.stop.assert_called_once()
+        np.testing.assert_array_equal(result, ring)
+        assert w._acquire_running is False
+
+    def test_flag_reset_at_start_of_each_acquire(self, DAQHandler):
+        """A stale False flag (from a prior abort) does not skip the next acquire."""
+        w, mock_task, mock_trigger, _, _ = self._setup_never_finishing(DAQHandler)
+        mock_trigger.add_data.side_effect = (
+            lambda data: setattr(mock_trigger, "finished", True)
+        )
+
+        w._acquire_running = False  # stale flag from a previous abort
+        result = w.acquire()
+
+        assert mock_trigger.add_data.call_count >= 1, "loop never ran"
+        assert isinstance(result, np.ndarray)

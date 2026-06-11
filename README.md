@@ -52,11 +52,16 @@ wrapper.disconnect()
 - **Analog output** (`AOTask`) -- voltage generation with continuous buffer regeneration
 - **Digital I/O** (`DITask` / `DOTask`) -- on-demand single-sample and clocked continuous modes
 - **Single-task handler** (`DAQHandler`) -- configure, connect, acquire/generate, disconnect lifecycle with software triggering via pyTrigger
-- **Multi-task synchronization** (`MultiHandler`) -- hardware-triggered finite acquisition and validated multi-task pipelines
+- **Multi-task synchronization** (`MultiHandler`) -- hardware-triggered finite acquisition and validated multi-task pipelines, with trigger-firing hooks and non-blocking acquisition
+- **Synchronized timing** -- finite/continuous acquisition modes, shared sample clocks (`clock_source`), and digital/analog edge start triggers (`set_start_trigger()`, `set_analog_start_trigger()`) on all task classes
+- **Acquisition control** -- `stop_acquisition()` cooperative abort, `is_running()`, `check_state()` auto-reconnection on both handlers
+- **Eager channel validation** -- `add_channel()` validates the configuration with the driver immediately (`TASK_VERIFY`), so invalid parameters raise on the offending line and IEPE/delta-sigma modules (NI 9234 etc.) work correctly (v0.2.0 behavior change: errors that previously surfaced at a later operation now surface inside `add_channel()`)
+- **NI MAX persistence** -- `save()` on all task classes persists the task to NI MAX; `from_name()` loads it back as a wrapper
+- **Task lifecycle** -- `configure()` / `start()` / `stop()` / `clear_task()` on all task classes
 - **TOML configuration** -- `save_config()` / `from_config()` for portable, human-readable task definitions with device aliases
 - **Device discovery** -- `list_devices()`, `list_tasks()`, `get_connected_devices()` for hardware enumeration
 - **Raw task injection** -- `from_task()` on all task classes wraps pre-configured `nidaqmx.Task` objects
-- **Factory classmethods** -- `from_name()` creates tasks from device name, `from_config()` from TOML
+- **Factory classmethods** -- `from_name()` creates tasks from a saved NI MAX task name, `from_config()` from TOML
 - **System introspection** -- `system_info()` returns structured device/driver/task inventory
 - **Context manager support** -- automatic resource cleanup with `with` statements
 - **Thread safety** -- `DAQHandler` and `MultiHandler` use per-instance `RLock` for concurrent access
@@ -74,6 +79,34 @@ wrapper.connect()
 data = wrapper.acquire()
 wrapper.disconnect()
 ```
+
+### NI MAX round-trip (save a task, reload it by name)
+
+Define a task programmatically once, persist it to NI MAX with `save()`,
+and reload it anywhere with `from_name()` -- no reconfiguration needed:
+
+```python
+from nidaqwrapper import AITask
+
+# Define and persist
+task = AITask('vibration', sample_rate=25600)
+task.add_channel('acc0', device='cDAQ1Mod1', channel_ind=0,
+                 sensitivity=100, sensitivity_units='mV/g', units='g')
+task.configure()
+task.save()  # persists to NI MAX; AITask's default clear_task=True releases the handle
+
+# Later (or in another script): reload and acquire
+task = AITask.from_name('vibration')
+task.start()
+data = task.acquire(1000)   # (1000, n_channels)
+task.stop()
+task.clear_task()
+```
+
+`AOTask`, `DITask`, and `DOTask` provide the same `save()` / `from_name()`
+pair (their `save()` keeps the task open by default, `clear_task=False`).
+Note: `get_task_by_name()` returns a *raw* `nidaqmx.task.Task`; use
+`from_name()` when you want a wrapper with `acquire()` / `generate()`.
 
 ### Digital output
 
@@ -166,6 +199,51 @@ data = adv.acquire()
 adv.disconnect()
 ```
 
+### Hardware-triggered synchronized burst (no raw nidaqmx needed)
+
+Build finite tasks sharing one sample clock and one start trigger entirely with
+nidaqwrapper, then acquire them as a synchronized burst:
+
+```python
+from nidaqwrapper import AITask, DITask, MultiHandler
+
+# Master analog task: finite acquisition, onboard clock
+ai = AITask('vibration', sample_rate=25600)
+ai.add_channel('acc0', device='cDAQ1Mod1', channel_ind=0,
+               sensitivity=100.0, sensitivity_units='mV/g', units='g')
+ai.configure(sample_mode='finite', samples_per_channel=25600,
+             clock_source='/cDAQ1Mod1/ai/SampleClock')
+ai.set_start_trigger('/cDAQ1/PFI0', edge='rising')
+
+# Slave digital task: same clock, same trigger
+di = DITask('flags', sample_rate=25600)
+di.add_channel('gate', lines='cDAQ1Mod2/port0/line0')
+di.configure(sample_mode='finite', samples_per_channel=25600,
+             clock_source='/cDAQ1Mod1/ai/SampleClock')
+di.set_start_trigger('/cDAQ1/PFI0', edge='rising')
+
+adv = MultiHandler()
+adv.configure(input_tasks=[ai.task, di.task])
+adv.connect()
+
+# Optional: hooks that select a bench procedure and fire the physical trigger
+adv.set_hardware_trigger_functions(start_function=fire_pfi_line,
+                                   support_function=select_procedure)
+
+future = adv.acquire(custom_mode='run_up', blocking=False)  # arms tasks, fires trigger
+data = future.result()   # {task_name: {channel_name: samples}}
+adv.disconnect()
+```
+
+`stop_acquisition()` aborts a software-triggered acquisition whose trigger never
+fires; `is_running()` and `check_state()` support watchdog-style health polling.
+
+> Note: tasks reporting different clock-source readbacks (a master on the onboard
+> clock reads back its timebase terminal, a slave the exported sample-clock terminal)
+> produce a `UserWarning` from `MultiHandler.configure()` instead of failing
+> validation — verify the clock wiring matches the warning. Mismatched sample rates
+> or samples-per-channel still fail validation.
+
 ### Context manager (automatic cleanup)
 
 ```python
@@ -200,7 +278,7 @@ raw_task.close()  # Caller retains ownership
 
 | Class | Module | Purpose |
 |-------|--------|---------|
-| `BaseTask` | `base_task` | Shared lifecycle, properties, `start()`, `from_task()`, `from_name()` |
+| `BaseTask` | `base_task` | Shared lifecycle, properties, `start()`, `stop()`, `save()`, `from_task()`, `from_name()` |
 | `AITask` | `ai_task` | Analog input -- channels, timing, acquisition |
 | `AOTask` | `ao_task` | Analog output -- channels, timing, generation |
 | `DITask` | `digital` | Digital input -- on-demand and clocked reads |
@@ -210,8 +288,8 @@ raw_task.close()  # Caller retains ownership
 
 | Class | Module | Purpose |
 |-------|--------|---------|
-| `DAQHandler` | `handler` | Single-task handler with software triggering, auto-reconnection |
-| `MultiHandler` | `multi_handler` | Multi-task orchestrator with hardware trigger validation |
+| `DAQHandler` | `handler` | Single-task handler with software triggering, auto-reconnection, acquisition abort |
+| `MultiHandler` | `multi_handler` | Multi-task orchestrator with hardware trigger validation, trigger hooks, non-blocking acquire, health checks |
 
 ### Utility Functions
 
@@ -231,7 +309,7 @@ The public API uses `(n_samples, n_channels)` for all multi-channel data. Intern
 - `DAQHandler.acquire()` returns `(n_samples, n_channels)` or a dict
 - `DAQHandler.read_all_available()` returns `(n_samples, n_channels)`
 - `DAQHandler.read()` returns `(n_channels,)` -- single sample
-- `AITask.acquire()` returns `(n_channels, n_samples)` -- internal format
+- `AITask.acquire()` returns `(n_samples, n_channels)`
 - `AOTask.generate(signal)` accepts `(n_samples, n_channels)` or `(n_samples,)`
 
 ## Requirements

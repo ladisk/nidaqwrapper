@@ -178,6 +178,15 @@ def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
     Iterates over tasks saved in NI MAX, matches by name, and calls
     ``.load()`` to return a ready-to-use ``nidaqmx.Task`` object.
 
+    This is a low-level helper: it returns a **raw** ``nidaqmx.task.Task``
+    by design, without ``acquire()``, ``generate()``, or ``configure()``.
+    To load a saved task as a wrapper object, use the ``from_name()``
+    classmethod of the matching task class instead::
+
+        task = AITask.from_name("MyInputTask")   # or AOTask / DITask / DOTask
+        task.start()
+        data = task.acquire(1000)
+
     Parameters
     ----------
     name : str
@@ -189,6 +198,13 @@ def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
         The loaded task object, or ``None`` if the task is already loaded
         by another process (error code -200089). The caller is responsible
         for deciding how to proceed.
+
+    See Also
+    --------
+    nidaqwrapper.AITask.from_name : Load a saved AI task as an AITask.
+    nidaqwrapper.AOTask.from_name : Load a saved AO task as an AOTask.
+    nidaqwrapper.DITask.from_name : Load a saved DI task as a DITask.
+    nidaqwrapper.DOTask.from_name : Load a saved DO task as a DOTask.
 
     Raises
     ------

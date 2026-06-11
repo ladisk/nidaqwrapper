@@ -44,6 +44,15 @@ def _make_mock_ni_task(samp_clk_rate: float = 10000) -> MagicMock:
     def _ao_handler(**kwargs):
         name = kwargs.get("name_to_assign_to_channel", "")
         phys = kwargs.get("physical_channel", "")
+        # Mimic the driver: duplicate physical AO channels are rejected
+        # natively at add time with DaqError -200371 (probed on SimDev1;
+        # fix-gh-issues-5-8 maps this to ValueError in add_channel()).
+        from nidaqmx.errors import DaqError
+        if any(c.physical_channel.name == phys for c in _channel_objects):
+            raise DaqError(
+                "Physical channel specified more than once in the task",
+                -200371,
+            )
         _channel_names.append(name)
         ch = MagicMock()
         ch.name = name
@@ -395,6 +404,344 @@ class TestAddChannel:
 
 
 # ===========================================================================
+# fix-gh-issues-5-8: eager validation + native duplicate mapping (issues #5, #6)
+# ===========================================================================
+
+class TestAddChannelEagerValidation:
+    """add_channel() configures timing and forces TASK_VERIFY after the add.
+
+    Fixes GH issue #6: deferred property validation (e.g. out-of-range
+    min/max, DaqError -200077) must surface inside the offending
+    add_channel() call, not at a later operation.
+    """
+
+    def test_add_cfg_verify_called_in_order(self, mock_system, mock_constants):
+        """Call order is: add channel -> cfg_samp_clk_timing -> TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            order = []
+            orig_add = mt.ao_channels.add_ao_voltage_chan.side_effect
+
+            def _tracking_add(**kwargs):
+                order.append("add")
+                return orig_add(**kwargs)
+
+            mt.ao_channels.add_ao_voltage_chan.side_effect = _tracking_add
+            mt.timing.cfg_samp_clk_timing.side_effect = (
+                lambda *a, **kw: order.append("cfg")
+            )
+            mt.control.side_effect = lambda *a, **kw: order.append("verify")
+
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert order == ["add", "cfg", "verify"]
+
+    def test_cfg_uses_stored_settings(self, mock_system, mock_constants):
+        """Eager timing config uses rate, CONTINUOUS, and the stored buffer size."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 10000
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == task.samples_per_channel
+        assert "source" not in kwargs
+
+    def test_verify_uses_task_verify_constant(self, mock_system, mock_constants):
+        """task.control() is called with TaskMode.TASK_VERIFY."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        mt.control.assert_called_once_with(mock_constants.TaskMode.TASK_VERIFY)
+
+    def test_cfg_uses_clock_source_after_configure(self, mock_system,
+                                                   mock_constants):
+        """A later add_channel() re-applies the stored external clock source."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+            task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=1)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["source"] == "/Dev1/ai/SampleClock"
+
+    def test_daqerror_from_verify_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by TASK_VERIFY propagates unchanged (issue #6)."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.control.side_effect = DaqError(
+                "requested value is not a supported value", -200077
+            )
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0,
+                                 min_val=-1e5, max_val=1e5)
+
+        assert exc_info.value.error_code == -200077
+
+    def test_daqerror_from_cfg_propagates(self, mock_system, mock_constants):
+        """A DaqError raised by cfg_samp_clk_timing propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.timing.cfg_samp_clk_timing.side_effect = DaqError(
+                "timing rejected", -201087
+            )
+            with pytest.raises(DaqError):
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+    def test_no_rate_coercion_check_in_add_channel(self, mock_system,
+                                                   mock_constants):
+        """add_channel() does NOT raise on rate coercion; configure() does."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=10240)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)  # no raise
+
+    def test_regen_mode_not_set_by_add_channel(self, mock_system, mock_constants):
+        """Regeneration mode stays a configure() concern (not set per add)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert (mt._out_stream.regen_mode
+                is not mock_constants.RegenerationMode.ALLOW_REGENERATION)
+
+
+class TestAddChannelDuplicateMapping:
+    """Duplicate detection delegates to the driver (-200371 -> ValueError)."""
+
+    def test_duplicate_maps_to_valueerror_chained(self, mock_system,
+                                                  mock_constants):
+        """DaqError -200371 from the driver maps to ValueError chained from it."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            with pytest.raises(ValueError, match="already in use") as exc_info:
+                task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=0)
+
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, DaqError)
+        assert cause.error_code == -200371
+
+    def test_other_daqerror_from_add_propagates(self, mock_system,
+                                                mock_constants):
+        """Any other DaqError from add_ao_voltage_chan propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ao_channels.add_ao_voltage_chan.side_effect = DaqError(
+                "device unavailable", -50103
+            )
+            with pytest.raises(DaqError) as exc_info:
+                task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        assert exc_info.value.error_code == -50103
+
+    def test_no_channel_iteration_in_add_channel(self, mock_system,
+                                                 mock_constants):
+        """add_channel() never iterates ao_channels (issue #5 regression):
+        adds succeed even when iterating would raise -201087."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            mt.ao_channels.__iter__ = MagicMock(
+                side_effect=DaqError("on-demand not supported", -201087)
+            )
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.add_channel("ao_1", device="cDAQ1Mod1", channel_ind=1)
+
+        assert mt.ao_channels.add_ao_voltage_chan.call_count == 2
+
+
+class TestFromTaskTimingGuard:
+    """from_task() tolerates untimed tasks on delta-sigma devices (issue #5)."""
+
+    # All timing attributes from_task() reads — on a real untimed
+    # delta-sigma task, EVERY one of these raises -201087 (implicit
+    # verification), so the mock must raise from all of them.
+    _TIMING_ATTRS = (
+        "samp_clk_rate",
+        "samp_quant_samp_per_chan",
+        "samp_quant_samp_mode",
+        "samp_clk_src",
+    )
+
+    def _make_external_task(self, mock_constants, rate_error=None,
+                            timing_error=None):
+        from unittest.mock import PropertyMock
+
+        task = MagicMock()
+        task.name = "external_task"
+        ch = MagicMock()
+        ch.name = "ao_0"
+        ch.physical_channel.name = "cDAQ1Mod1/ao0"
+        task.ao_channels = [ch]
+        task.channel_names = ["ao_0"]
+        task.is_task_done = MagicMock(return_value=True)
+        if timing_error is not None:
+            # ALL timing reads raise (real untimed delta-sigma behavior)
+            for attr in self._TIMING_ATTRS:
+                setattr(
+                    type(task.timing), attr,
+                    PropertyMock(side_effect=timing_error),
+                )
+        else:
+            task.timing.samp_quant_samp_per_chan = 50000
+            task.timing.samp_quant_samp_mode = (
+                mock_constants.AcquisitionType.CONTINUOUS
+            )
+            task.timing.samp_clk_src = ""
+            if rate_error is not None:
+                type(task.timing).samp_clk_rate = PropertyMock(
+                    side_effect=rate_error
+                )
+            else:
+                task.timing.samp_clk_rate = 10000
+        return task
+
+    def test_all_timing_reads_201087_safe_defaults_single_warning(
+            self, mock_system, mock_constants):
+        """All timing reads raising -201087 -> wrapper created with safe
+        defaults (mirroring __init__) and exactly one warning."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants,
+            timing_error=DaqError("timing not configured", -201087),
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate is None
+        assert task.samples_per_channel is None
+        assert task.sample_mode == mock_constants.AcquisitionType.CONTINUOUS
+        assert task.clock_source is None
+        assert len(w) == 1
+        assert "sample rate" in str(w[0].message).lower()
+        assert "-201087" in str(w[0].message)
+
+    def test_samp_clk_rate_201087_sets_none_and_warns(self, mock_system,
+                                                      mock_constants):
+        """DaqError -201087 reading samp_clk_rate -> sample_rate=None + warning."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants, rate_error=DaqError("timing not configured", -201087)
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate is None
+        assert task.samples_per_channel is None
+        assert task.clock_source is None
+        assert any("sample rate" in str(x.message).lower() for x in w)
+
+    def test_samp_clk_rate_other_daqerror_propagates(self, mock_system,
+                                                     mock_constants):
+        """Any other DaqError reading samp_clk_rate propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        external = self._make_external_task(
+            mock_constants, rate_error=DaqError("device gone", -50103)
+        )
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with pytest.raises(DaqError) as exc_info:
+                AOTask.from_task(external)
+
+        assert exc_info.value.error_code == -50103
+
+    def test_normal_task_timing_reads_unchanged_no_warning(self, mock_system,
+                                                           mock_constants):
+        """A normally-timed task is read without warnings; values intact."""
+        external = self._make_external_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                task = AOTask.from_task(external)
+
+        assert task.sample_rate == 10000
+        assert task.samples_per_channel == 50000
+        assert task.sample_mode == mock_constants.AcquisitionType.CONTINUOUS
+        assert task.clock_source is None
+        assert len(w) == 0
+
+
+class TestApplyTimingSampleRateGuard:
+    """_apply_timing() refuses to run with sample_rate=None (review F2)."""
+
+    def test_sample_rate_none_raises_runtime_error(self, mock_system,
+                                                   mock_constants):
+        """sample_rate=None -> explicit RuntimeError, not an opaque
+        ctypes error from cfg_samp_clk_timing(rate=None)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.sample_rate = None
+            with pytest.raises(RuntimeError, match="sample_rate is not set"):
+                task._apply_timing()
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+
+class TestConfigureStateConsistency:
+    """configure() persists clock_source only after the driver accepts
+    the timing (review F3)."""
+
+    def test_rejected_timing_leaves_stored_state_unchanged(self, mock_system,
+                                                           mock_constants):
+        """cfg_samp_clk_timing raising in configure() -> stored
+        clock_source keeps its prior value (add_channel() must not
+        replay rejected settings)."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            assert task.clock_source is None
+
+            mt.timing.cfg_samp_clk_timing.side_effect = DaqError(
+                "timing rejected", -200077
+            )
+            with pytest.raises(DaqError):
+                task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source is None
+
+    def test_accepted_timing_persists_new_state(self, mock_system,
+                                                mock_constants):
+        """When the driver accepts the timing, configure() stores the
+        new clock_source (unchanged behavior)."""
+        ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source == "/Dev1/ai/SampleClock"
+
+
+# ===========================================================================
 # Task Group 4.4: configure() — sets timing and regeneration mode
 # ===========================================================================
 
@@ -406,6 +753,8 @@ class TestConfigure:
         ctx, task, mt = _build(mock_system, mock_constants, sample_rate=10000)
         with ctx:
             task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            # add_channel() applies timing eagerly; isolate configure()'s call
+            mt.timing.cfg_samp_clk_timing.reset_mock()
             task.configure()
 
         mt.timing.cfg_samp_clk_timing.assert_called_once()
@@ -499,6 +848,8 @@ class TestConfigure:
         ctx, task, mt = _build(mock_system, mock_constants)
         with ctx:
             task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            # add_channel() applies timing eagerly; isolate configure()'s call
+            mt.timing.cfg_samp_clk_timing.reset_mock()
             task.configure()
             task.start()
 
@@ -546,6 +897,114 @@ class TestBaseTaskStart:
 
             with pytest.raises(RuntimeError):
                 task.start()
+
+
+# ===========================================================================
+# fix-gh-issues-5-8: save() and stop() — inherited from BaseTask (issue #7/#8)
+# ===========================================================================
+
+def _make_external_task_for_gate(mock_constants) -> MagicMock:
+    """Minimal external mock nidaqmx task for ownership-gate tests."""
+    task = MagicMock()
+    task.name = "external_task"
+    ch = MagicMock()
+    ch.name = "ao_0"
+    ch.physical_channel.name = "cDAQ1Mod1/ao0"
+    task.ao_channels = [ch]
+    task.channel_names = ["ao_0"]
+    task.timing.samp_clk_rate = 10000
+    task.timing.samp_quant_samp_per_chan = 50000
+    task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+class TestSave:
+    """AOTask.save() persists the task to NI MAX (BaseTask implementation)."""
+
+    def test_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+
+        task.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_default_does_not_clear(self, mock_system, mock_constants):
+        """Shared BaseTask default is clear_task=False — task stays open."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        task.clear_task = MagicMock()
+
+        task.save()
+        task.clear_task.assert_not_called()
+        assert task.task is mt
+
+    def test_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        task.clear_task = MagicMock()
+
+        task.save(clear_task=True)
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+        task.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_task_for_gate(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                task.save()
+
+        external.save.assert_not_called()
+
+
+class TestStop:
+    """AOTask.stop() delegates to self.task.stop() (BaseTask implementation)."""
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop() on the nidaqmx task."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.stop.assert_called_once()
+
+    def test_stop_does_not_close_task(self, mock_system, mock_constants):
+        """stop() leaves the task handle open (unlike clear_task())."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+            task.configure()
+            task.start()
+            task.stop()
+
+        mt.close.assert_not_called()
+        assert task.task is mt
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_task_for_gate(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                task.stop()
+
+        external.stop.assert_not_called()
 
 
 # ===========================================================================
@@ -1826,3 +2285,224 @@ class TestFromName:
             from nidaqwrapper.ao_task import AOTask
             with pytest.raises(RuntimeError, match="already loaded"):
                 AOTask.from_name("BusyTask")
+
+
+# ===========================================================================
+# task-sync-configuration: set_start_trigger() (inherited from BaseTask)
+# ===========================================================================
+
+def _make_external_ao_task(mock_constants) -> MagicMock:
+    """Create a minimal external mock nidaqmx task for from_task() tests."""
+    task = MagicMock()
+    task.name = "external_task"
+
+    ch = MagicMock()
+    ch.name = "ao_0"
+    ch.physical_channel.name = "cDAQ1Mod1/ao0"
+    task.ao_channels = [ch]
+    task.channel_names = ["ao_0"]
+
+    task.timing.samp_clk_rate = 10000
+    task.timing.samp_quant_samp_per_chan = 50000
+    task.timing.samp_quant_samp_mode = mock_constants.AcquisitionType.CONTINUOUS
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+class TestAOSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on AOTask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/Dev1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            task.set_start_trigger("/Dev1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                task.set_start_trigger("/Dev1/PFI0", edge="level")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(0)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                task.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_ao_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.set_start_trigger("/Dev1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+# ===========================================================================
+# task-sync-configuration: configure(clock_source=...)
+# ===========================================================================
+
+class TestConfigureClockSource:
+    """configure() accepts a keyword-only external clock_source."""
+
+    def _add_channel(self, task):
+        task.add_channel("ao_0", device="cDAQ1Mod1", channel_ind=0)
+        # add_channel() applies timing eagerly (fix-gh-issues-5-8); reset
+        # the timing mock so each test asserts configure()'s calls only.
+        task.task.timing.cfg_samp_clk_timing.reset_mock()
+
+    def test_clock_source_passed_as_source(self, mock_system, mock_constants):
+        """A non-empty clock_source is forwarded as source= to cfg_samp_clk_timing."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["source"] == "/Dev1/ai/SampleClock"
+        # Output stays continuous with the regular buffer size
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == task.samples_per_channel
+
+    def test_default_call_shape_unchanged(self, mock_system, mock_constants):
+        """configure() with defaults omits the source kwarg entirely."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure()
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+
+    def test_external_clock_skips_rate_coercion_check(self, mock_system, mock_constants):
+        """With clock_source set, a differing reported rate does NOT raise."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=9000)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")  # no raise
+
+    def test_internal_clock_keeps_rate_coercion_check(self, mock_system, mock_constants):
+        """Without clock_source the rate-coercion ValueError stays active."""
+        ctx, task, mt = _build(mock_system, mock_constants,
+                               sample_rate=10000, samp_clk_rate=9000)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="rate"):
+                task.configure()
+
+    @pytest.mark.parametrize("bad_source", ["", 42, ["/Dev1/PFI0"]])
+    def test_invalid_clock_source_raises(self, mock_system, mock_constants,
+                                         bad_source):
+        """clock_source must be a non-empty string (or None)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            with pytest.raises(ValueError, match="clock_source"):
+                task.configure(clock_source=bad_source)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_explicit_none_clock_source_same_as_default(self, mock_system,
+                                                        mock_constants):
+        """configure(clock_source=None) omits source= exactly like configure()."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source=None)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert task.clock_source is None
+
+    def test_not_owned_configure_raises(self, mock_system, mock_constants):
+        """configure(clock_source=...) keeps the ownership gate (RuntimeError)."""
+        external = _make_external_ao_task(mock_constants)
+
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            from nidaqwrapper.ao_task import AOTask
+            task = AOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        external.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_regeneration_still_enabled_with_clock_source(self, mock_system,
+                                                          mock_constants):
+        """Buffer regeneration is enabled also with an external clock source
+        (the onboard-clock path is covered by the existing TestConfigure)."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert (mt._out_stream.regen_mode
+                is mock_constants.RegenerationMode.ALLOW_REGENERATION)
+
+    def test_stores_clock_source_attribute(self, mock_system, mock_constants):
+        """configure() stores self.clock_source for introspection."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            self._add_channel(task)
+            task.configure(clock_source="/Dev1/ai/SampleClock")
+
+        assert task.clock_source == "/Dev1/ai/SampleClock"
+
+    def test_clock_source_attribute_default(self, mock_system, mock_constants):
+        """clock_source defaults to None at construction and after configure()."""
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            assert task.clock_source is None
+            self._add_channel(task)
+            task.configure()
+
+        assert task.clock_source is None

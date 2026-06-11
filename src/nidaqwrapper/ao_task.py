@@ -39,18 +39,25 @@ from __future__ import annotations
 import pathlib
 import warnings
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 
 try:
     import nidaqmx
     from nidaqmx import constants
+    from nidaqmx.errors import DaqError
 
     _NIDAQMX_AVAILABLE = True
 except ImportError:
     _NIDAQMX_AVAILABLE = False
+    DaqError = Exception  # type: ignore[misc,assignment]
 
 from .base_task import BaseTask
+
+# Sentinel for _apply_timing() parameters — distinguishes "not passed,
+# use the stored attribute" from an explicit ``None`` candidate value.
+_UNSET: Any = object()
 
 
 class AOTask(BaseTask):
@@ -96,6 +103,10 @@ class AOTask(BaseTask):
             self.samples_per_channel = int(samples_per_channel)
 
         self.sample_mode = constants.AcquisitionType.CONTINUOUS
+
+        # External sample clock terminal (introspection only — the live
+        # nidaqmx task remains the source of truth). Set by configure().
+        self.clock_source: str | None = None
 
         # Discover connected devices
         system = nidaqmx.system.System.local()
@@ -155,6 +166,20 @@ class AOTask(BaseTask):
         RuntimeError
             If this task wraps an externally-provided nidaqmx.Task
             (created via :meth:`from_task`).
+        nidaqmx.errors.DaqError
+            If the driver rejects the channel configuration.  After the
+            channel is added, sample-clock timing is configured with the
+            task's current settings and the driver validates the whole
+            task (``TASK_VERIFY``), so invalid parameters (e.g. an
+            out-of-range *min_val*/*max_val*, DaqError -200077) raise
+            here instead of at a later operation.
+
+        Notes
+        -----
+        NI-DAQmx cannot remove channels from a task.  If ``add_channel()``
+        raises after the driver accepted the channel but validation
+        failed, the task still contains the invalid channel — recreate
+        the task (``clear_task()`` and build a new one) before retrying.
         """
         # Block channel addition for externally-provided tasks
         if not self._owns_task:
@@ -175,24 +200,76 @@ class AOTask(BaseTask):
 
         physical_channel = f"{device}/ao{channel_ind}"
 
-        # Duplicate physical channel detection: iterate the live task channels
-        for ch in self.task.ao_channels:
-            if ch.physical_channel.name == physical_channel:
+        # Duplicate physical channel detection is delegated to the driver:
+        # it natively rejects duplicate physical AO channels at add time
+        # with DaqError -200371, mapped here to the documented ValueError.
+        # (No channel iteration — iterating channel objects triggers
+        # implicit verification, which raises -201087 on untimed tasks on
+        # delta-sigma devices; GH issue #5.)
+        try:
+            self.task.ao_channels.add_ao_voltage_chan(
+                physical_channel=physical_channel,
+                name_to_assign_to_channel=channel_name,
+                min_val=min_val,
+                max_val=max_val,
+            )
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -200371:
                 raise ValueError(
                     f"Physical channel ao{channel_ind} on device "
                     f"'{device}' is already in use."
-                )
+                ) from exc
+            raise
 
-        self.task.ao_channels.add_ao_voltage_chan(
-            physical_channel=physical_channel,
-            name_to_assign_to_channel=channel_name,
-            min_val=min_val,
-            max_val=max_val,
-        )
+        # -- Eager validation (GH issues #5, #6) -----------------------------
+        # Configure sample-clock timing with the task's current stored
+        # settings, then force driver validation.  Timing first: verifying
+        # an untimed task would itself raise -201087 on delta-sigma devices.
+        # Validation errors (e.g. -200077 out-of-range limits) surface here,
+        # on the offending add_channel() call.  DaqErrors propagate
+        # unchanged.  Regeneration mode remains a configure() concern.
+        self._apply_timing()
+        self.task.control(constants.TaskMode.TASK_VERIFY)
+
+    def _apply_timing(self, clock_source: Any = _UNSET) -> None:
+        """Apply sample-clock timing settings to the live task.
+
+        Shared by :meth:`configure` and :meth:`add_channel` so the timing
+        call cannot diverge between the two paths.  Reads the stored
+        attributes (``sample_rate``, ``samples_per_channel``); AO output
+        is always continuous.  *clock_source* defaults to the stored
+        attribute; :meth:`configure` passes the candidate value explicitly
+        so that nothing is persisted unless the driver accepts the timing.
+
+        Raises
+        ------
+        RuntimeError
+            If ``sample_rate`` is ``None`` (the task was wrapped via
+            :meth:`from_task` without timing configuration).
+        """
+        if self.sample_rate is None:
+            raise RuntimeError(
+                "sample_rate is not set (task was wrapped without timing "
+                "configuration); set sample_rate and call configure() "
+                "before adding channels."
+            )
+
+        if clock_source is _UNSET:
+            clock_source = self.clock_source
+
+        timing_kwargs: dict[str, Any] = {
+            "rate": self.sample_rate,
+            "sample_mode": constants.AcquisitionType.CONTINUOUS,
+            "samps_per_chan": self.samples_per_channel,
+        }
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
+
+        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
     # -- Task lifecycle -------------------------------------------------------
 
-    def configure(self) -> None:
+    def configure(self, *, clock_source: str | None = None) -> None:
         """Configure sample-clock timing for continuous output generation.
 
         Sets up the sample-clock timing on the nidaqmx task, enables
@@ -200,34 +277,58 @@ class AOTask(BaseTask):
         requested sample rate.  Call :meth:`start` afterwards to begin
         generation.
 
+        Parameters
+        ----------
+        clock_source : str, optional
+            Terminal name of an external sample clock (e.g.
+            ``'/Dev1/ai/SampleClock'``).  ``None`` (default) uses the
+            onboard clock.  When set, the rate-coercion check is skipped —
+            the reported rate is whatever the external clock provides, so
+            *sample_rate* must match the master task's rate (it sizes
+            buffers and timeouts).
+
         Raises
         ------
         ValueError
-            If no channels have been added, or if the hardware driver
-            coerces the sample rate to a different value than requested
-            (some devices only support discrete rates).
+            If no channels have been added; if *clock_source* is not a
+            non-empty string; or if the hardware driver coerces the
+            sample rate while using the onboard clock (some devices only
+            support discrete rates).
         RuntimeError
             If this task wraps an externally-provided nidaqmx.Task
             (created via :meth:`from_task`).
         """
         self._check_start_preconditions()
 
-        self.task.timing.cfg_samp_clk_timing(
-            rate=self.sample_rate,
-            sample_mode=constants.AcquisitionType.CONTINUOUS,
-            samps_per_chan=self.samples_per_channel,
-        )
+        if clock_source is not None and (
+            not isinstance(clock_source, str) or not clock_source
+        ):
+            raise ValueError(
+                f"clock_source must be a non-empty terminal name string "
+                f"(e.g. '/Dev1/ai/SampleClock') or None, got {clock_source!r}."
+            )
+
+        # Apply timing with the candidate clock source; persist it for
+        # introspection only after the driver accepts the configuration.
+        # A rejected cfg call must not leave stored state diverging from
+        # the live task — add_channel() would replay rejected settings.
+        self._apply_timing(clock_source=clock_source)
+        self.clock_source = clock_source
 
         self.task._out_stream.regen_mode = constants.RegenerationMode.ALLOW_REGENERATION
 
-        actual_rate = float(self.task.timing.samp_clk_rate)
-        requested_rate = float(self.sample_rate)
-        if actual_rate != requested_rate:
-            raise ValueError(
-                f"Sample rate {requested_rate} Hz is not supported by this "
-                f"device. The driver coerced it to {actual_rate} Hz. "
-                "Use a rate that the device supports."
-            )
+        # Rate-coercion check applies only to the onboard clock: with an
+        # external clock_source the reported rate is whatever the exported
+        # clock provides (validating it is the master task's job).
+        if clock_source is None:
+            actual_rate = float(self.task.timing.samp_clk_rate)
+            requested_rate = float(self.sample_rate)
+            if actual_rate != requested_rate:
+                raise ValueError(
+                    f"Sample rate {requested_rate} Hz is not supported by this "
+                    f"device. The driver coerced it to {actual_rate} Hz. "
+                    "Use a rate that the device supports."
+                )
 
     # -- Signal generation ---------------------------------------------------
 
@@ -495,9 +596,49 @@ class AOTask(BaseTask):
         # Populate attributes from the live task
         instance.task = task
         instance.task_name = task.name
-        instance.sample_rate = task.timing.samp_clk_rate
-        instance.samples_per_channel = task.timing.samp_quant_samp_per_chan
-        instance.sample_mode = task.timing.samp_quant_samp_mode
+
+        # Timing attributes — single consolidated guard.  Reading ANY
+        # timing property forces implicit task verification; on an untimed
+        # task on a device that rejects on-demand timing (delta-sigma)
+        # every such read raises DaqError -201087 (GH issue #5), so all
+        # timing reads live in this one block.  -201087 → one warning +
+        # safe defaults mirroring __init__; other DaqErrors propagate.
+        try:
+            instance.sample_rate = task.timing.samp_clk_rate
+            instance.samples_per_channel = task.timing.samp_quant_samp_per_chan
+            instance.sample_mode = task.timing.samp_quant_samp_mode
+
+            # External clock terminal — secondary read failures fall back
+            # to the safe default (None) with a warning.
+            instance.clock_source = None
+            try:
+                clk_src = task.timing.samp_clk_src
+                instance.clock_source = clk_src if clk_src else None
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read sample clock source from task: {exc}",
+                    stacklevel=2,
+                )
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -201087:
+                instance.sample_rate = None
+                instance.samples_per_channel = None
+                instance.sample_mode = constants.AcquisitionType.CONTINUOUS
+                instance.clock_source = None
+                warnings.warn(
+                    "Could not read the timing configuration from the "
+                    "task: no sample-clock timing is configured and the "
+                    "device rejects on-demand timing (DaqError -201087). "
+                    "The sample rate is set to None and the remaining "
+                    "timing attributes to their defaults — call "
+                    "configure() after setting sample_rate, or configure "
+                    "timing on the nidaqmx task before wrapping.",
+                    stacklevel=2,
+                )
+            else:
+                raise
 
         # Derive device info from the task itself
         instance.device_list = [dev.name for dev in task.devices]

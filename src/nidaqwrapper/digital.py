@@ -34,7 +34,7 @@ try:
 except ImportError:
     _NIDAQMX_AVAILABLE = False
 
-from .base_task import BaseTask
+from .base_task import _SAMPLE_MODE_ATTR, BaseTask
 
 
 def _expand_port_to_line_range(lines: str) -> str:
@@ -125,6 +125,12 @@ class DITask(BaseTask):
         self.sample_rate = sample_rate
         self.mode: str = "on_demand" if sample_rate is None else "clocked"
 
+        # Synchronized-acquisition settings (introspection only — the live
+        # nidaqmx task remains the source of truth). Set by configure().
+        self.sample_mode_str: str = "continuous"
+        self.samples_per_channel: int | None = None
+        self.clock_source: str | None = None
+
         # Discover connected devices
         system = nidaqmx.system.System.local()
         self.device_list: list[str] = [dev.name for dev in system.devices]
@@ -199,27 +205,111 @@ class DITask(BaseTask):
 
     # -- Task lifecycle -------------------------------------------------------
 
-    def configure(self) -> None:
+    def configure(
+        self,
+        *,
+        sample_mode: str = "continuous",
+        samples_per_channel: int | None = None,
+        clock_source: str | None = None,
+    ) -> None:
         """Configure timing for digital input.
 
-        In clocked mode, configures sample-clock timing for continuous
-        acquisition.  In on-demand mode, this is a no-op (no timing to
-        configure).  Call :meth:`start` afterwards to begin acquisition.
+        In clocked mode, configures sample-clock timing.  In on-demand
+        mode this is a no-op (no timing to configure) and passing any of
+        the synchronization parameters raises ``RuntimeError``.  Call
+        :meth:`start` afterwards to begin acquisition.  Defaults reproduce
+        the classic behavior: continuous acquisition from the onboard clock.
+
+        Parameters
+        ----------
+        sample_mode : str, optional
+            ``'continuous'`` (default) or ``'finite'``.  Finite tasks
+            acquire exactly *samples_per_channel* samples and then stop —
+            the mode used for hardware-triggered synchronized acquisition.
+            Clocked mode only.
+        samples_per_channel : int, optional
+            Number of samples per channel.  Required (> 0) for
+            ``'finite'`` mode.  With ``'continuous'`` mode it is an
+            optional buffer-size hint (nidaqmx semantics).  Clocked mode
+            only.
+        clock_source : str, optional
+            Terminal name of an external sample clock (e.g.
+            ``'/cDAQ1Mod1/ai/SampleClock'``).  ``None`` (default) uses the
+            onboard clock.  Clocked mode only.
 
         Raises
         ------
         ValueError
-            If no channels have been added to the task.
+            If no channels have been added; if *sample_mode* is not
+            ``'continuous'``/``'finite'``; if ``'finite'`` is requested
+            without a positive integer *samples_per_channel*; or if
+            *clock_source* is not a non-empty string.
         RuntimeError
-            If this task was created via :meth:`from_task` (externally provided).
+            If this task was created via :meth:`from_task` (externally
+            provided), or if any synchronization parameter is passed in
+            on-demand mode.
         """
         self._check_start_preconditions()
 
-        if self.mode == "clocked":
-            self.task.timing.cfg_samp_clk_timing(
-                rate=self.sample_rate,
-                sample_mode=constants.AcquisitionType.CONTINUOUS,
+        if self.mode != "clocked":
+            if (
+                sample_mode != "continuous"
+                or samples_per_channel is not None
+                or clock_source is not None
+            ):
+                raise RuntimeError(
+                    "Synchronization parameters (sample_mode, "
+                    "samples_per_channel, clock_source) require clocked "
+                    "mode. Create the DITask with a sample_rate to enable "
+                    "clocked acquisition."
+                )
+            return  # on-demand: nothing to configure
+
+        if sample_mode not in _SAMPLE_MODE_ATTR:
+            raise ValueError(
+                f"sample_mode must be one of {list(_SAMPLE_MODE_ATTR)}, "
+                f"got {sample_mode!r}."
             )
+        if samples_per_channel is not None and (
+            not isinstance(samples_per_channel, int)
+            or isinstance(samples_per_channel, bool)
+            or samples_per_channel <= 0
+        ):
+            raise ValueError(
+                f"samples_per_channel must be a positive integer, "
+                f"got {samples_per_channel!r}."
+            )
+        if sample_mode == "finite" and samples_per_channel is None:
+            raise ValueError(
+                "samples_per_channel must be specified (int > 0) when "
+                "sample_mode='finite'."
+            )
+        if clock_source is not None and (
+            not isinstance(clock_source, str) or not clock_source
+        ):
+            raise ValueError(
+                f"clock_source must be a non-empty terminal name string "
+                f"(e.g. '/cDAQ1Mod1/ai/SampleClock') or None, "
+                f"got {clock_source!r}."
+            )
+
+        timing_kwargs: dict[str, Any] = {
+            "rate": self.sample_rate,
+            "sample_mode": getattr(
+                constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode]
+            ),
+        }
+        if samples_per_channel is not None:
+            timing_kwargs["samps_per_chan"] = samples_per_channel
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
+
+        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
+
+        # Store for introspection — the live task remains the source of truth
+        self.sample_mode_str = sample_mode
+        self.samples_per_channel = samples_per_channel
+        self.clock_source = clock_source
 
     # -- Data acquisition ----------------------------------------------------
 
@@ -248,6 +338,12 @@ class DITask(BaseTask):
             for scripts and notebooks.  If ``None`` (default), drains every
             sample currently in the buffer without blocking
             (``READ_ALL_AVAILABLE``) — suitable for acquisition loops.
+
+            On a **finite** task (``configure(sample_mode='finite', ...)``)
+            ``acquire()`` with the default ``None`` blocks until the finite
+            acquisition completes and returns all
+            ``samples_per_channel`` samples — this is the synchronization
+            mechanism for hardware-triggered multi-task acquisition.
 
         Returns
         -------
@@ -462,6 +558,12 @@ class DITask(BaseTask):
             # No timing configured — assume on-demand
             instance.sample_rate = None
             instance.mode = "on_demand"
+
+        # Synchronized-acquisition attributes: safe defaults only.  Deriving
+        # them from an external task is in scope for AITask.from_task() only.
+        instance.sample_mode_str = "continuous"
+        instance.samples_per_channel = None
+        instance.clock_source = None
 
         # Derive device info from the task itself
         instance.device_list = [dev.name for dev in task.devices]

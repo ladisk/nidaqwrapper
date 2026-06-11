@@ -2932,3 +2932,558 @@ class TestFromNameDO:
             from nidaqwrapper.digital import DOTask
             with pytest.raises(RuntimeError, match="already loaded"):
                 DOTask.from_name("BusyTask")
+
+
+# ===========================================================================
+# task-sync-configuration: set_start_trigger() (inherited from BaseTask)
+# ===========================================================================
+
+def _make_external_digital_task(channel_attr: str) -> MagicMock:
+    """Create a minimal external mock nidaqmx task for from_task() tests.
+
+    Parameters
+    ----------
+    channel_attr : str
+        Either ``"di_channels"`` or ``"do_channels"``.
+    """
+    task = MagicMock()
+    task.name = "external_task"
+
+    ch = MagicMock()
+    ch.name = "ch0"
+    ch.physical_channel.name = "Dev1/port0/line0"
+    setattr(task, channel_attr, [ch])
+    task.channel_names = ["ch0"]
+
+    task.timing.samp_clk_rate = 1000
+    task.is_task_done = MagicMock(return_value=True)
+    return task
+
+
+# ===========================================================================
+# fix-gh-issues-5-8: save() and stop() on DITask/DOTask (issues #7/#8)
+# ===========================================================================
+
+class TestDITaskSaveStop:
+    """DITask gains save() and stop() via BaseTask."""
+
+    def test_save_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+
+        di.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_save_default_does_not_clear(self, mock_system, mock_constants):
+        """Default clear_task=False — the task stays open after save()."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+        di.clear_task = MagicMock()
+
+        di.save()
+        di.clear_task.assert_not_called()
+        assert di.task is mt
+
+    def test_save_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, di, mt = _build_di(mock_system, mock_constants)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+        di.clear_task = MagicMock()
+
+        di.save(clear_task=True)
+        di.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                di.save()
+
+        external.save.assert_not_called()
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop()."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("ch", lines="Dev1/port0/line0")
+            di.configure()
+            di.start()
+            di.stop()
+
+        mt.stop.assert_called_once()
+        mt.close.assert_not_called()
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                di.stop()
+
+        external.stop.assert_not_called()
+
+
+class TestDOTaskSaveStop:
+    """DOTask gains save() and stop() via BaseTask."""
+
+    def test_save_calls_nidaqmx_save(self, mock_system, mock_constants):
+        """save() calls task.save(overwrite_existing_task=True)."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+
+        do.save()
+        mt.save.assert_called_once_with(overwrite_existing_task=True)
+
+    def test_save_default_does_not_clear(self, mock_system, mock_constants):
+        """Default clear_task=False — the task stays open after save()."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+        do.clear_task = MagicMock()
+
+        do.save()
+        do.clear_task.assert_not_called()
+        assert do.task is mt
+
+    def test_save_clear_task_true_clears(self, mock_system, mock_constants):
+        """save(clear_task=True) calls clear_task() after saving."""
+        ctx, do, mt = _build_do(mock_system, mock_constants)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+        do.clear_task = MagicMock()
+
+        do.save(clear_task=True)
+        do.clear_task.assert_called_once()
+
+    def test_save_blocked_on_external_task(self, mock_system, mock_constants):
+        """save() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot save"):
+                do.save()
+
+        external.save.assert_not_called()
+
+    def test_stop_calls_task_stop(self, mock_system, mock_constants):
+        """stop() delegates to self.task.stop()."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.add_channel("ch", lines="Dev1/port1/line0")
+            do.configure()
+            do.start()
+            do.stop()
+
+        mt.stop.assert_called_once()
+        mt.close.assert_not_called()
+
+    def test_stop_blocked_on_external_task(self, mock_system, mock_constants):
+        """stop() raises RuntimeError when _owns_task is False."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="[Cc]annot stop"):
+                do.stop()
+
+        external.stop.assert_not_called()
+
+
+class TestDITaskSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on DITask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/cDAQ1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                di.set_start_trigger("/cDAQ1/PFI0", edge="both")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger(["PFI0"])
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                di.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_on_demand_mode_allowed(self, mock_system, mock_constants):
+        """Design decision 3: no ordering/timing constraint enforced on trigger
+        configuration — it also works on an on-demand DITask."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.set_start_trigger("/cDAQ1/PFI0")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                di.set_start_trigger("/cDAQ1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+class TestDOTaskSetStartTrigger:
+    """set_start_trigger() configures a digital edge start trigger on DOTask."""
+
+    def test_default_rising_edge(self, mock_system, mock_constants):
+        """Default edge='rising' maps to constants.Edge.RISING."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.set_start_trigger("/cDAQ1/PFI0")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        kwargs = trig.call_args.kwargs
+        assert kwargs["trigger_source"] == "/cDAQ1/PFI0"
+        assert kwargs["trigger_edge"] is mock_constants.Edge.RISING
+
+    def test_falling_edge(self, mock_system, mock_constants):
+        """edge='falling' maps to constants.Edge.FALLING."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.set_start_trigger("/cDAQ1/PFI1", edge="falling")
+
+        trig = mt.triggers.start_trigger.cfg_dig_edge_start_trig
+        trig.assert_called_once()
+        assert trig.call_args.kwargs["trigger_edge"] is mock_constants.Edge.FALLING
+
+    def test_invalid_edge_raises(self, mock_system, mock_constants):
+        """An edge string other than 'rising'/'falling' raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="edge"):
+                do.set_start_trigger("/cDAQ1/PFI0", edge="rise")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_empty_source_raises(self, mock_system, mock_constants):
+        """An empty source string raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger("")
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_non_string_source_raises(self, mock_system, mock_constants):
+        """A non-string source raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger(7)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_none_source_raises(self, mock_system, mock_constants):
+        """source=None raises ValueError."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            with pytest.raises(ValueError, match="source"):
+                do.set_start_trigger(None)
+
+        mt.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+    def test_not_owned_raises(self, mock_system, mock_constants):
+        """A task wrapped via from_task() (not owned) raises RuntimeError."""
+        external = _make_external_digital_task("do_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DOTask
+            do = DOTask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                do.set_start_trigger("/cDAQ1/PFI0")
+
+        external.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+
+
+# ===========================================================================
+# task-sync-configuration: DITask.configure() sync extensions
+# ===========================================================================
+
+class TestDITaskConfigureSync:
+    """DITask.configure(sample_mode=, samples_per_channel=, clock_source=)."""
+
+    def test_finite_clocked_all_kwargs(self, mock_system, mock_constants):
+        """Finite clocked DI: FINITE mode, samps_per_chan and source forwarded."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="finite", samples_per_channel=500,
+                         clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        mt.timing.cfg_samp_clk_timing.assert_called_once()
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["rate"] == 1000
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.FINITE
+        assert kwargs["samps_per_chan"] == 500
+        assert kwargs["source"] == "/cDAQ1Mod1/ai/SampleClock"
+        assert di.samples_per_channel == 500
+
+    def test_finite_without_samples_per_channel_raises(self, mock_system,
+                                                       mock_constants):
+        """Finite mode without samples_per_channel raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                di.configure(sample_mode="finite")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_invalid_sample_mode_raises(self, mock_system, mock_constants):
+        """An unknown sample_mode string raises ValueError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="sample_mode"):
+                di.configure(sample_mode="burst")
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    # True is included deliberately: isinstance(True, int) holds in Python,
+    # so bools must be rejected explicitly by the implementation.  None is
+    # included because finite mode requires an explicit positive count.
+    @pytest.mark.parametrize("bad_count", [0, -5, 2.5, "100", True, None])
+    def test_invalid_samples_per_channel_raises(self, mock_system, mock_constants,
+                                                bad_count):
+        """samples_per_channel must be a positive int (bool excluded)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="samples_per_channel"):
+                di.configure(sample_mode="finite", samples_per_channel=bad_count)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    @pytest.mark.parametrize("bad_source", ["", 42, ["/Dev1/PFI0"]])
+    def test_invalid_clock_source_raises(self, mock_system, mock_constants,
+                                         bad_source):
+        """clock_source must be a non-empty string (or None)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(ValueError, match="clock_source"):
+                di.configure(clock_source=bad_source)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    @pytest.mark.parametrize("sync_kwargs", [
+        {"sample_mode": "finite", "samples_per_channel": 10},
+        {"samples_per_channel": 10},
+        {"clock_source": "/cDAQ1Mod1/ai/SampleClock"},
+        {"sample_mode": "finite"},
+    ])
+    def test_on_demand_sync_kwargs_raise(self, mock_system, mock_constants,
+                                         sync_kwargs):
+        """Any sync parameter in on-demand mode raises RuntimeError."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            with pytest.raises(RuntimeError, match="clocked"):
+                di.configure(**sync_kwargs)
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_on_demand_plain_configure_still_noop(self, mock_system, mock_constants):
+        """configure() without arguments stays a no-op in on-demand mode."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=None)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure()  # no raise
+
+        mt.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_default_clocked_call_shape_unchanged(self, mock_system, mock_constants):
+        """Clocked configure() with defaults omits source and samps_per_chan."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure()
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert "samps_per_chan" not in kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+
+    def test_clock_source_none_omits_source_kwarg(self, mock_system, mock_constants):
+        """Explicit clock_source=None omits source= exactly like the default."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(clock_source=None)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert "source" not in kwargs
+        assert di.clock_source is None
+
+    def test_continuous_with_samples_per_channel_allowed(self, mock_system,
+                                                         mock_constants):
+        """samples_per_channel with 'continuous' is a buffer-size hint (allowed)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="continuous", samples_per_channel=2000)
+
+        kwargs = mt.timing.cfg_samp_clk_timing.call_args.kwargs
+        assert kwargs["sample_mode"] is mock_constants.AcquisitionType.CONTINUOUS
+        assert kwargs["samps_per_chan"] == 2000
+
+    def test_stores_introspection_attributes(self, mock_system, mock_constants):
+        """configure() stores sample_mode_str, samples_per_channel, clock_source."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:3")
+            di.configure(sample_mode="finite", samples_per_channel=500,
+                         clock_source="/cDAQ1Mod1/ai/SampleClock")
+
+        assert di.sample_mode_str == "finite"
+        assert di.samples_per_channel == 500
+        assert di.clock_source == "/cDAQ1Mod1/ai/SampleClock"
+
+    def test_attributes_initialized_at_construction(self, mock_system,
+                                                    mock_constants):
+        """New attributes exist with defaults before configure() is called."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            assert di.sample_mode_str == "continuous"
+            assert di.samples_per_channel is None
+            assert di.clock_source is None
+
+    def test_not_owned_configure_raises(self, mock_system, mock_constants):
+        """configure(sync kwargs) keeps the ownership gate (RuntimeError)."""
+        external = _make_external_digital_task("di_channels")
+
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            from nidaqwrapper.digital import DITask
+            di = DITask.from_task(external)
+
+            with pytest.raises(RuntimeError, match="externally-provided"):
+                di.configure(sample_mode="finite", samples_per_channel=10)
+
+        external.timing.cfg_samp_clk_timing.assert_not_called()
+
+    def test_dotask_configure_signature_unchanged(self, mock_system, mock_constants):
+        """DOTask.configure() does not accept the sync keywords (out of scope)."""
+        ctx, do, mt = _build_do(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            do.add_channel("lines", lines="Dev1/port1/line0:3")
+            with pytest.raises(TypeError):
+                do.configure(sample_mode="finite", samples_per_channel=10)
+
+
+# ===========================================================================
+# task-sync-configuration: finite blocking-read contract for DITask.acquire()
+# ===========================================================================
+
+class TestDITaskFiniteAcquireContract:
+    """acquire() on a finite DI task reads with READ_ALL_AVAILABLE (-1), which
+    in nidaqmx blocks until the finite acquisition completes."""
+
+    def test_finite_acquire_reads_all_available(self, mock_system, mock_constants):
+        """After finite configure, acquire() calls read(-1) and returns
+        (n_samples, n_lines)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("lines", lines="Dev1/port0/line0:1")
+            di.configure(sample_mode="finite", samples_per_channel=4)
+
+            # nidaqmx returns (n_lines, n_samples) — full finite acquisition.
+            # Blocking until completion is nidaqmx driver behavior for finite
+            # tasks; the wrapper just passes -1 (READ_ALL_AVAILABLE).
+            mt.read.return_value = [
+                [True, False, True, False],
+                [False, True, False, True],
+            ]
+
+            result = di.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 2)
+        # Pin the transpose: columns are lines, rows are samples
+        np.testing.assert_array_equal(result[:, 0], [True, False, True, False])
+        np.testing.assert_array_equal(result[:, 1], [False, True, False, True])
+
+    def test_finite_acquire_single_line(self, mock_system, mock_constants):
+        """Finite single-line acquisition returns (n_samples, 1)."""
+        ctx, di, mt = _build_di(mock_system, mock_constants, sample_rate=1000)
+        with ctx:
+            di.add_channel("line", lines="Dev1/port0/line0")
+            di.configure(sample_mode="finite", samples_per_channel=4)
+
+            mt.read.return_value = [True, False, True, False]
+
+            result = di.acquire()
+
+        mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
+        assert result.shape == (4, 1)

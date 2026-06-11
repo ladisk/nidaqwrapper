@@ -13,10 +13,18 @@ where nidaqmx references are patched per-subclass module.
 
 from __future__ import annotations
 
+import sys
 import warnings
 from typing import Any
 
 from .utils import _require_nidaqmx, get_task_by_name
+
+# String-to-enum-attribute mappings shared by all task classes.  Values are
+# nidaqmx enum *attribute names*, resolved against the live ``constants``
+# namespace at call time (keeps this module free of nidaqmx imports and
+# honours per-subclass-module test patches).
+_EDGE_ATTR: dict[str, str] = {"rising": "RISING", "falling": "FALLING"}
+_SAMPLE_MODE_ATTR: dict[str, str] = {"continuous": "CONTINUOUS", "finite": "FINITE"}
 
 
 class BaseTask:
@@ -116,6 +124,83 @@ class BaseTask:
                 "Call add_channel() before configure()."
             )
 
+    def _nidaqmx_constants(self) -> Any:
+        """Resolve the nidaqmx ``constants`` namespace for this instance.
+
+        Looks up the ``constants`` attribute of the concrete subclass's
+        module (e.g. ``nidaqwrapper.ai_task``) so that per-module test
+        patches are honoured and this module keeps its no-nidaqmx-import
+        design constraint.
+
+        Returns
+        -------
+        Any
+            The ``nidaqmx.constants`` namespace (or a test double).
+
+        Raises
+        ------
+        RuntimeError
+            If nidaqmx is not installed.
+        """
+        consts = getattr(sys.modules[type(self).__module__], "constants", None)
+        if consts is None:
+            _require_nidaqmx()
+            from nidaqmx import constants as consts
+        return consts
+
+    def set_start_trigger(self, source: str, edge: str = "rising") -> None:
+        """Configure a digital edge start trigger for this task.
+
+        Arms the task to wait for a digital edge on *source* before it
+        starts acquiring or generating samples.  Used to synchronize
+        multiple tasks from a shared trigger line (e.g. a PFI terminal).
+        Configure the trigger before calling :meth:`start`.
+
+        Parameters
+        ----------
+        source : str
+            Terminal name of the trigger source
+            (e.g. ``'/Dev1/PFI0'``, ``'/cDAQ1/PFI0'``).
+        edge : str, optional
+            Trigger edge: ``'rising'`` (default) or ``'falling'``.
+
+        Raises
+        ------
+        ValueError
+            If *source* is not a non-empty string, or *edge* is not
+            ``'rising'`` or ``'falling'``.
+        RuntimeError
+            If this task was created via :meth:`from_task` (externally
+            owned — configure triggers on the nidaqmx.Task directly).
+
+        Examples
+        --------
+        >>> task.configure()
+        >>> task.set_start_trigger("/cDAQ1/PFI0", edge="rising")
+        >>> task.start()  # waits for the trigger edge
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot configure a trigger on an externally-provided task. "
+                "Configure the nidaqmx.Task directly or pass an "
+                "already-configured task to from_task()."
+            )
+        if not isinstance(source, str) or not source:
+            raise ValueError(
+                f"source must be a non-empty terminal name string "
+                f"(e.g. '/Dev1/PFI0'), got {source!r}."
+            )
+        if edge not in _EDGE_ATTR:
+            raise ValueError(
+                f"edge must be one of {list(_EDGE_ATTR)}, got {edge!r}."
+            )
+
+        constants = self._nidaqmx_constants()
+        self.task.triggers.start_trigger.cfg_dig_edge_start_trig(
+            trigger_source=source,
+            trigger_edge=getattr(constants.Edge, _EDGE_ATTR[edge]),
+        )
+
     def start(self) -> None:
         """Start the hardware task.
 
@@ -135,6 +220,59 @@ class BaseTask:
                 "already-started task to from_task()."
             )
         self.task.start()
+
+    def stop(self) -> None:
+        """Stop the hardware task.
+
+        Stops acquisition or generation on the underlying nidaqmx task
+        without releasing the task handle — call :meth:`start` to resume
+        or :meth:`clear_task` to release the hardware.  Stopping a task
+        that is not running is a no-op (driver semantics).
+
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — stop the nidaqmx.Task directly).
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot stop an externally-provided task. "
+                "Stop the nidaqmx.Task directly — the external caller "
+                "owns the task lifecycle."
+            )
+        self.task.stop()
+
+    def save(self, clear_task: bool = False) -> None:
+        """Save the task to NI MAX.
+
+        Persists the task definition (channels, timing) to NI MAX via
+        ``task.save(overwrite_existing_task=True)`` so it can be reloaded
+        later with :meth:`from_name`.
+
+        Parameters
+        ----------
+        clear_task : bool, optional
+            If ``True``, call :meth:`clear_task` after saving.  Default is
+            ``False`` (the task remains usable).  Note: :class:`AITask`
+            overrides this default to ``True`` for backward compatibility.
+
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — call ``task.save()`` directly).
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot save an externally-provided task. "
+                "Call task.save() on the nidaqmx.Task directly — the "
+                "external caller owns the task lifecycle."
+            )
+        self.task.save(overwrite_existing_task=True)
+
+        if clear_task:
+            self.clear_task()
 
     # -- Context manager -----------------------------------------------------
 

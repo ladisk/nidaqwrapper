@@ -22,19 +22,30 @@ from __future__ import annotations
 import pathlib
 import warnings
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 
-from .base_task import BaseTask
+from .base_task import _SAMPLE_MODE_ATTR, BaseTask
 from .utils import UNITS, UNITS_REVERSE, _require_nidaqmx
 
 try:
     import nidaqmx
     from nidaqmx import constants
+    from nidaqmx.errors import DaqError
 
     _NIDAQMX_AVAILABLE = True
 except ImportError:
     _NIDAQMX_AVAILABLE = False
+    DaqError = Exception  # type: ignore[misc,assignment]
+
+# String-to-enum-attribute mapping for analog trigger slopes, resolved
+# against the live ``constants`` namespace at call time.
+_SLOPE_ATTR: dict[str, str] = {"rising": "RISING", "falling": "FALLING"}
+
+# Sentinel for _apply_timing() parameters — distinguishes "not passed,
+# use the stored attribute" from an explicit ``None`` candidate value.
+_UNSET: Any = object()
 
 
 class AITask(BaseTask):
@@ -97,6 +108,12 @@ class AITask(BaseTask):
             )
 
         self.sample_mode = constants.AcquisitionType.CONTINUOUS
+
+        # Synchronized-acquisition settings (introspection only — the live
+        # nidaqmx task remains the source of truth). Set by configure().
+        self.sample_mode_str: str = "continuous"
+        self.samples_per_channel: int | None = None
+        self.clock_source: str | None = None
 
         # Create the nidaqmx task immediately — it is the single source of truth
         self.task = nidaqmx.task.Task(new_task_name=task_name)
@@ -167,6 +184,20 @@ class AITask(BaseTask):
         RuntimeError
             If this task was created via :meth:`from_task` (channels must
             be configured on the nidaqmx task before wrapping).
+        nidaqmx.errors.DaqError
+            If the driver rejects the channel configuration.  After the
+            channel is added, sample-clock timing is configured with the
+            task's current settings and the driver validates the whole
+            task (``TASK_VERIFY``), so invalid parameters (e.g. an
+            out-of-range *min_val*/*max_val*) raise here instead of at a
+            later operation.
+
+        Notes
+        -----
+        NI-DAQmx cannot remove channels from a task.  If ``add_channel()``
+        raises after the driver accepted the channel but validation
+        failed, the task still contains the invalid channel — recreate
+        the task (``clear_task()`` and build a new one) before retrying.
         """
         # -- Ownership check ------------------------------------------------
         if not self._owns_task:
@@ -192,14 +223,35 @@ class AITask(BaseTask):
         if not device or not isinstance(device, str):
             raise ValueError("device must be a non-empty string")
 
-        # Duplicate physical channel detection: iterate the live task channels
+        # Duplicate physical channel detection: iterate the live task channels.
+        # The driver (and TASK_VERIFY) ACCEPTS duplicate physical AI channels,
+        # so this pre-check is the only protection against silent
+        # double-sampling.  Iterating channel objects reads channel
+        # attributes, which triggers implicit task verification — on devices
+        # that reject on-demand timing (delta-sigma/IEPE) an untimed task
+        # raises DaqError -201087 here (GH issue #5).  Our own add path
+        # always leaves timing configured, so this guard only fires for
+        # externally-built untimed tasks wrapped with take_ownership=True.
         physical_channel = f"{device}/ai{channel_ind}"
-        for ch in self.task.ai_channels:
-            if ch.physical_channel.name == physical_channel:
-                raise ValueError(
-                    f"Physical channel ai{channel_ind} on device "
-                    f"'{device}' is already in use."
+        try:
+            for ch in self.task.ai_channels:
+                if ch.physical_channel.name == physical_channel:
+                    raise ValueError(
+                        f"Physical channel ai{channel_ind} on device "
+                        f"'{device}' is already in use."
+                    )
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -201087:
+                warnings.warn(
+                    "Duplicate-channel pre-check skipped: the task has no "
+                    "sample-clock timing configured and the device rejects "
+                    "on-demand timing (DaqError -201087). Ensure the "
+                    f"physical channel '{physical_channel}' is not already "
+                    "in the task.",
+                    stacklevel=2,
                 )
+            else:
+                raise
 
         # -- Scale type validation ------------------------------------------
         if scale is not None and not isinstance(scale, (int, float, tuple)):
@@ -304,40 +356,224 @@ class AITask(BaseTask):
                 options["units"] = resolved_units
             self.task.ai_channels.add_ai_voltage_chan(**options)
 
+        # -- Eager validation (GH issues #5, #6) -----------------------------
+        # Configure sample-clock timing with the task's current stored
+        # settings, then force driver validation.  Timing first: verifying
+        # an untimed task would itself raise -201087 on delta-sigma devices.
+        # Validation errors (e.g. -200077 out-of-range limits) surface here,
+        # on the offending add_channel() call, instead of at a later
+        # verification-forcing operation.  DaqErrors propagate unchanged.
+        self._apply_timing()
+        self.task.control(constants.TaskMode.TASK_VERIFY)
+
+    def _apply_timing(
+        self,
+        sample_mode_str: Any = _UNSET,
+        samples_per_channel: Any = _UNSET,
+        clock_source: Any = _UNSET,
+    ) -> None:
+        """Apply sample-clock timing settings to the live task.
+
+        Shared by :meth:`configure` and :meth:`add_channel` so the timing
+        call cannot diverge between the two paths.  Parameters default to
+        the stored introspection attributes (``sample_mode_str``,
+        ``samples_per_channel``, ``clock_source``); :meth:`configure`
+        passes candidate values explicitly so that nothing is persisted
+        unless the driver accepts the timing.
+
+        Raises
+        ------
+        RuntimeError
+            If ``sample_rate`` is ``None`` (the task was wrapped via
+            :meth:`from_task` without timing configuration).
+        """
+        if self.sample_rate is None:
+            raise RuntimeError(
+                "sample_rate is not set (task was wrapped without timing "
+                "configuration); set sample_rate and call configure() "
+                "before adding channels."
+            )
+
+        if sample_mode_str is _UNSET:
+            sample_mode_str = self.sample_mode_str
+        if samples_per_channel is _UNSET:
+            samples_per_channel = self.samples_per_channel
+        if clock_source is _UNSET:
+            clock_source = self.clock_source
+
+        acq_type = getattr(
+            constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode_str]
+        )
+
+        timing_kwargs: dict[str, Any] = {
+            "rate": self.sample_rate,
+            "sample_mode": acq_type,
+        }
+        if samples_per_channel is not None:
+            timing_kwargs["samps_per_chan"] = samples_per_channel
+        if clock_source is not None:
+            timing_kwargs["source"] = clock_source
+
+        self.task.timing.cfg_samp_clk_timing(**timing_kwargs)
 
     # -- Task lifecycle ------------------------------------------------------
 
-    def configure(self) -> None:
-        """Configure sample-clock timing for continuous acquisition.
+    def configure(
+        self,
+        *,
+        sample_mode: str = "continuous",
+        samples_per_channel: int | None = None,
+        clock_source: str | None = None,
+    ) -> None:
+        """Configure sample-clock timing for acquisition.
 
         Sets up the sample-clock timing on the nidaqmx task and validates
         that the driver accepted the requested sample rate.  Call
-        :meth:`start` afterwards to begin acquisition.
+        :meth:`start` afterwards to begin acquisition.  Defaults reproduce
+        the classic behavior: continuous acquisition from the onboard clock.
+
+        Parameters
+        ----------
+        sample_mode : str, optional
+            ``'continuous'`` (default) or ``'finite'``.  Finite tasks
+            acquire exactly *samples_per_channel* samples and then stop —
+            the mode used for hardware-triggered synchronized acquisition.
+        samples_per_channel : int, optional
+            Number of samples per channel.  Required (> 0) for
+            ``'finite'`` mode.  With ``'continuous'`` mode it is an
+            optional buffer-size hint (nidaqmx semantics).
+        clock_source : str, optional
+            Terminal name of an external sample clock (e.g.
+            ``'/cDAQ1Mod1/ai/SampleClock'``).  ``None`` (default) uses the
+            onboard clock.  When set, the rate-coercion check is skipped —
+            the reported rate is whatever the external clock provides, so
+            *sample_rate* must match the master task's rate (it sizes
+            buffers and timeouts).
 
         Raises
         ------
         ValueError
-            If the hardware driver coerces the sample rate to a different
-            value than requested (some devices only support discrete rates).
+            If *sample_mode* is not ``'continuous'``/``'finite'``; if
+            ``'finite'`` is requested without a positive integer
+            *samples_per_channel*; if *clock_source* is not a non-empty
+            string; or if the driver coerces the sample rate while using
+            the onboard clock.
         RuntimeError
             If this task was created via :meth:`from_task` (timing must
             be configured on the nidaqmx task before wrapping).
         """
         self._check_start_preconditions()
 
-        self.task.timing.cfg_samp_clk_timing(
-            rate=self.sample_rate,
-            sample_mode=constants.AcquisitionType.CONTINUOUS,
-        )
-
-        actual_rate = float(self.task.timing.samp_clk_rate)
-        requested_rate = float(self.sample_rate)
-        if actual_rate != requested_rate:
+        if sample_mode not in _SAMPLE_MODE_ATTR:
             raise ValueError(
-                f"Sample rate {requested_rate} Hz is not supported by this "
-                f"device. The driver coerced it to {actual_rate} Hz. "
-                "Use a rate that the device supports."
+                f"sample_mode must be one of {list(_SAMPLE_MODE_ATTR)}, "
+                f"got {sample_mode!r}."
             )
+        if samples_per_channel is not None and (
+            not isinstance(samples_per_channel, int)
+            or isinstance(samples_per_channel, bool)
+            or samples_per_channel <= 0
+        ):
+            raise ValueError(
+                f"samples_per_channel must be a positive integer, "
+                f"got {samples_per_channel!r}."
+            )
+        if sample_mode == "finite" and samples_per_channel is None:
+            raise ValueError(
+                "samples_per_channel must be specified (int > 0) when "
+                "sample_mode='finite'."
+            )
+        if clock_source is not None and (
+            not isinstance(clock_source, str) or not clock_source
+        ):
+            raise ValueError(
+                f"clock_source must be a non-empty terminal name string "
+                f"(e.g. '/cDAQ1Mod1/ai/SampleClock') or None, "
+                f"got {clock_source!r}."
+            )
+
+        # Apply timing with the candidate settings; persist them for
+        # introspection only after the driver accepts the configuration.
+        # A rejected cfg call must not leave stored state diverging from
+        # the live task — add_channel() would replay rejected settings.
+        self._apply_timing(
+            sample_mode_str=sample_mode,
+            samples_per_channel=samples_per_channel,
+            clock_source=clock_source,
+        )
+        self.sample_mode = getattr(
+            constants.AcquisitionType, _SAMPLE_MODE_ATTR[sample_mode]
+        )
+        self.sample_mode_str = sample_mode
+        self.samples_per_channel = samples_per_channel
+        self.clock_source = clock_source
+
+        # Rate-coercion check applies only to the onboard clock: with an
+        # external clock_source the reported rate is whatever the exported
+        # clock provides (validating it is the master task's job).
+        if clock_source is None:
+            actual_rate = float(self.task.timing.samp_clk_rate)
+            requested_rate = float(self.sample_rate)
+            if actual_rate != requested_rate:
+                raise ValueError(
+                    f"Sample rate {requested_rate} Hz is not supported by this "
+                    f"device. The driver coerced it to {actual_rate} Hz. "
+                    "Use a rate that the device supports."
+                )
+
+    def set_analog_start_trigger(
+        self,
+        source: str,
+        slope: str = "rising",
+        level: float = 0.0,
+    ) -> None:
+        """Configure an analog edge start trigger for this task.
+
+        Arms the task to wait for the analog signal on *source* to cross
+        *level* with the given *slope* before starting the acquisition.
+        Configure the trigger before calling :meth:`start`.
+
+        Parameters
+        ----------
+        source : str
+            Name of the analog trigger source (e.g. ``'APFI0'`` or an
+            analog input channel like ``'Dev1/ai0'``).
+        slope : str, optional
+            Trigger slope: ``'rising'`` (default) or ``'falling'``.
+        level : float, optional
+            Threshold level in the units of the trigger source signal,
+            by default ``0.0``.  Coerced to ``float``.
+
+        Raises
+        ------
+        ValueError
+            If *source* is not a non-empty string, or *slope* is not
+            ``'rising'`` or ``'falling'``.
+        RuntimeError
+            If this task was created via :meth:`from_task` (externally
+            owned — configure triggers on the nidaqmx.Task directly).
+        """
+        if not self._owns_task:
+            raise RuntimeError(
+                "Cannot configure a trigger on an externally-provided task. "
+                "Configure the nidaqmx.Task directly or pass an "
+                "already-configured task to from_task()."
+            )
+        if not isinstance(source, str) or not source:
+            raise ValueError(
+                f"source must be a non-empty trigger source name string "
+                f"(e.g. 'APFI0'), got {source!r}."
+            )
+        if slope not in _SLOPE_ATTR:
+            raise ValueError(
+                f"slope must be one of {list(_SLOPE_ATTR)}, got {slope!r}."
+            )
+
+        self.task.triggers.start_trigger.cfg_anlg_edge_start_trig(
+            trigger_source=source,
+            trigger_slope=getattr(constants.Slope, _SLOPE_ATTR[slope]),
+            trigger_level=float(level),
+        )
 
     def acquire(self, n_samples: int | None = None) -> np.ndarray:
         """Read samples from the hardware buffer.
@@ -350,6 +586,12 @@ class AITask(BaseTask):
             for scripts and notebooks.  If ``None`` (default), drains every
             sample currently in the buffer without blocking (``READ_ALL_
             AVAILABLE``) — suitable for acquisition loops.
+
+            On a **finite** task (``configure(sample_mode='finite', ...)``)
+            ``acquire()`` with the default ``None`` blocks until the finite
+            acquisition completes and returns all
+            ``samples_per_channel`` samples — this is the synchronization
+            mechanism for hardware-triggered multi-task acquisition.
 
         Returns
         -------
@@ -375,19 +617,22 @@ class AITask(BaseTask):
     def save(self, clear_task: bool = True) -> None:
         """Save the task to NI MAX.
 
-        The task always exists in the direct-delegation architecture, so
-        this method calls ``task.save()`` directly without auto-initiating.
-        After saving, optionally closes the task.
+        Thin override of :meth:`BaseTask.save` that keeps AITask's
+        historical default of clearing the task after saving.
 
         Parameters
         ----------
         clear_task : bool, optional
             If ``True`` (default), call :meth:`clear_task` after saving.
-        """
-        self.task.save(overwrite_existing_task=True)
+            Note: the shared :meth:`BaseTask.save` defaults to ``False``.
 
-        if clear_task:
-            self.clear_task()
+        Raises
+        ------
+        RuntimeError
+            If this task was created via :meth:`from_task`
+            (externally owned — call ``task.save()`` directly).
+        """
+        super().save(clear_task=clear_task)
 
     # -- TOML config persistence --------------------------------------------
 
@@ -671,8 +916,65 @@ class AITask(BaseTask):
 
         instance.task = task
         instance.task_name = task.name
-        instance.sample_rate = float(task.timing.samp_clk_rate)
-        instance.sample_mode = task.timing.samp_quant_samp_mode
+
+        # Timing attributes — single consolidated guard.  Reading ANY
+        # timing property forces implicit task verification; on an untimed
+        # task on a device that rejects on-demand timing (delta-sigma/IEPE)
+        # every such read raises DaqError -201087 (GH issue #5), so all
+        # timing reads live in this one block.  -201087 → one warning +
+        # safe defaults mirroring __init__; other DaqErrors propagate.
+        try:
+            instance.sample_rate = float(task.timing.samp_clk_rate)
+            instance.sample_mode = task.timing.samp_quant_samp_mode
+
+            # Synchronized-acquisition attributes — secondary read
+            # failures fall back to safe defaults with a warning.
+            instance.sample_mode_str = "continuous"
+            instance.samples_per_channel = None
+            instance.clock_source = None
+            try:
+                if instance.sample_mode == constants.AcquisitionType.FINITE:
+                    instance.sample_mode_str = "finite"
+                    instance.samples_per_channel = int(
+                        task.timing.samp_quant_samp_per_chan
+                    )
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read finite samples_per_channel from "
+                    f"task: {exc}",
+                    stacklevel=2,
+                )
+            try:
+                clk_src = task.timing.samp_clk_src
+                instance.clock_source = clk_src if clk_src else None
+            except Exception as exc:
+                if getattr(exc, "error_code", None) == -201087:
+                    raise  # handled by the consolidated guard below
+                warnings.warn(
+                    f"Could not read sample clock source from task: {exc}",
+                    stacklevel=2,
+                )
+        except DaqError as exc:
+            if getattr(exc, "error_code", None) == -201087:
+                instance.sample_rate = None
+                instance.sample_mode = constants.AcquisitionType.CONTINUOUS
+                instance.sample_mode_str = "continuous"
+                instance.samples_per_channel = None
+                instance.clock_source = None
+                warnings.warn(
+                    "Could not read the timing configuration from the "
+                    "task: no sample-clock timing is configured and the "
+                    "device rejects on-demand timing (DaqError -201087). "
+                    "The sample rate is set to None and the remaining "
+                    "timing attributes to their defaults — call "
+                    "configure() after setting sample_rate, or configure "
+                    "timing on the nidaqmx task before wrapping.",
+                    stacklevel=2,
+                )
+            else:
+                raise
 
         # Ownership flag: controls whether mutating methods are permitted
         # and whether clear_task() closes the underlying nidaqmx task.
