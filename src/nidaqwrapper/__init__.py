@@ -1,6 +1,6 @@
 """nidaqwrapper: Unified NI-DAQmx Python Wrapper."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .base_task import BaseTask
 from .utils import (
