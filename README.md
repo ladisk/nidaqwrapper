@@ -17,7 +17,7 @@ pip install nidaqwrapper
 For development:
 
 ```bash
-git clone https://github.com/tibor-barsi/nidaqwrapper.git
+git clone https://github.com/ladisk/nidaqwrapper.git
 cd nidaqwrapper
 pip install -e ".[dev]"
 ```

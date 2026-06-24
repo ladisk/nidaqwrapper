@@ -35,8 +35,8 @@ dependencies = [
 examples = ["jupyter", "matplotlib"]
 
 [project.urls]
-Homepage = "https://github.com/tibor-barsi/nidaqwrapper"
-Repository = "https://github.com/tibor-barsi/nidaqwrapper"
+Homepage = "https://github.com/ladisk/nidaqwrapper"
+Repository = "https://github.com/ladisk/nidaqwrapper"
 
 [tool.setuptools.packages.find]
 where = ["src"]
