@@ -9,15 +9,18 @@ Or exclude them from a normal run with::
 
     uv run pytest -m "not hardware"
 
-Hardware configuration
-----------------------
-- cDAQ2       : NI cDAQ-9174 USB chassis (device index 0)
-- cDAQ2Mod3   : NI 9260 (BNC) — 2 AO channels (device index 1)
-- cDAQ2Mod4   : NI 9215 (BNC) — 4 AI voltage channels (device index 2)
-- Dev1        : PCIe-6320 — 16 AI, 24 DI, 24 DO, 0 AO (device index 3)
+Hardware configuration (resolved by product_type — see ``_resolve_roles``)
+-------------------------------------------------------------------------
+- NI 9234 (IEPE / delta-sigma AI)  -> role ``iepe``  (e.g. cDAQ6Mod1)
+- NI 9215 (SAR AI)                 -> role ``sar``   (e.g. cDAQ6Mod2)
+- NI 9260 (delta-sigma AO)         -> role ``ao``    (e.g. cDAQ6Mod3)
 
-Note: cDAQ USB chassis may re-enumerate after system restart (cDAQ1 → cDAQ2).
-Update the constants below if device names change.
+Loopback wiring: 9260 ao0 -> 9215 ai0 ; 9260 ao1 -> 9234 ai0.
+
+Note: the USB cDAQ chassis re-enumerates across reboots (cDAQ1 -> cDAQ2 ->
+… -> cDAQ6).  Modules are therefore resolved by ``product_type`` substring,
+not by device name, so the suite auto-targets them regardless of enumeration.
+No digital module is present on this rig (``DI_LINES``/``DO_LINES`` = None).
 
 NI MAX tasks
 ------------
@@ -40,32 +43,60 @@ import pytest
 pytestmark = pytest.mark.hardware
 
 # ---------------------------------------------------------------------------
-# Hardware constants — update if the rig changes
-# Set to None to skip tests that require that hardware.
+# Hardware role resolution — by product_type, enumeration-independent.
+# Resolves to None (tests skip) when the driver/devices are unavailable, so the
+# module imports cleanly on CI under `-m "not hardware"`.  A session-scoped
+# `hw_roles` fixture in conftest.py mirrors this for new role-based tests.
 # ---------------------------------------------------------------------------
 
-# Analog input: cDAQ2Mod4 (NI 9215)
-AI_DEVICE_NAME = "cDAQ2Mod4"
-AI_DEVICE = "cDAQ2Mod4"
+
+def _resolve_roles() -> dict[str, str]:
+    """Map roles ``{iepe, sar, ao}`` -> device name by product_type substring."""
+    roles: dict[str, str] = {}
+    try:
+        from nidaqwrapper import list_devices
+
+        for dev in list_devices():
+            product_type = dev["product_type"]
+            if "9234" in product_type:
+                roles["iepe"] = dev["name"]
+            elif "9215" in product_type:
+                roles["sar"] = dev["name"]
+            elif "9260" in product_type:
+                roles["ao"] = dev["name"]
+    except Exception:  # no driver / no devices — tests skip via skip_if_no_device
+        pass
+    return roles
+
+
+_ROLES = _resolve_roles()
+
+# Analog input: NI 9215 (SAR)
+AI_DEVICE_NAME = _ROLES.get("sar")
+AI_DEVICE = AI_DEVICE_NAME
 AI_SAMPLE_RATE = 25600  # exact rate supported by NI 9215
 AI_VOLTAGE_MIN = -10.0
 AI_VOLTAGE_MAX = 10.0
 
-# Analog output: cDAQ2Mod3 (NI 9260)
-AO_DEVICE_NAME = "cDAQ2Mod3"
-AO_DEVICE = "cDAQ2Mod3"
+# Analog output: NI 9260 (delta-sigma)
+AO_DEVICE_NAME = _ROLES.get("ao")
+AO_DEVICE = AO_DEVICE_NAME
 AO_SAMPLE_RATE = 25600  # exact rate supported by NI 9260
 AO_VOLTAGE_RANGE = 4.242  # NI 9260 max output ±4.242641V (use slightly under)
 
-# Digital I/O: Dev1 (PCIe-6320) — set to None if no DI/DO hardware
-DI_LINES = "Dev1/port0/line0"
-DO_LINES = "Dev1/port1/line0"
+# IEPE / delta-sigma AI: NI 9234 (issue #5 lives here)
+IEPE_DEVICE_NAME = _ROLES.get("iepe")
+IEPE_DEVICE = IEPE_DEVICE_NAME
 
-# Second AI device for multi-task: Dev1 (PCIe-6320)
-AI2_DEVICE_NAME = "Dev1"
-AI2_DEVICE = "Dev1"
+# No digital module on this rig — digital tests skip.
+DI_LINES = None
+DO_LINES = None
 
-# NI MAX task — set to None if no saved tasks exist
+# Second AI device for multi-task tests: the NI 9234 (delta-sigma).
+AI2_DEVICE_NAME = _ROLES.get("iepe")
+AI2_DEVICE = AI2_DEVICE_NAME
+
+# NI MAX task — set to None if no saved tasks exist (IM3 present on this rig).
 NI_MAX_TASK_NAME = "IM3"
 
 
@@ -138,6 +169,7 @@ class TestDeviceDiscovery:
         if tasks:
             for t in tasks:
                 assert isinstance(t, str), f"Expected string task name, got: {type(t)}"
+        if tasks and NI_MAX_TASK_NAME is not None:
             assert NI_MAX_TASK_NAME in tasks, (
                 f"Expected '{NI_MAX_TASK_NAME}' in task list, got: {tasks}"
             )
@@ -716,7 +748,13 @@ class TestIEPEConsecutiveAdd:
     """
 
     def test_two_accel_channels_consecutive_add(self) -> None:
-        """Two consecutive accel adds succeed; both channels are present."""
+        """Two consecutive accel adds succeed; both channels are present.
+
+        SAFETY: uses ``channel_ind`` 1 and 2, NOT 0.  On the loopback rig the
+        9234's ai0 is wired to a live 9260 AO output, and IEPE excitation
+        (2 mA constant current) MUST NEVER be driven into an active output.
+        ai1/ai2 are unwired, so enabling IEPE on them is safe.
+        """
         device = _find_iepe_module()
         if device is None:
             pytest.skip(
@@ -728,14 +766,139 @@ class TestIEPEConsecutiveAdd:
         task = AITask("test_issue5_iepe_adds", sample_rate=25600)
         try:
             task.add_channel(
-                "acc0", device=device, channel_ind=0,
+                "acc0", device=device, channel_ind=1,
                 sensitivity=100.0, sensitivity_units="mV/g", units="g",
             )
             # This second add raised DaqError -201087 before the fix
             task.add_channel(
-                "acc1", device=device, channel_ind=1,
+                "acc1", device=device, channel_ind=2,
                 sensitivity=100.0, sensitivity_units="mV/g", units="g",
             )
             assert task.channel_list == ["acc0", "acc1"]
+        finally:
+            task.clear_task()
+
+
+# ===========================================================================
+# cdaq6-hardware-validation: behaviors validated on the real cDAQ6 rig
+# ===========================================================================
+
+
+class TestAOToAILoopback:
+    """AO->AI loopback signal-path validation (RMS / FFT).
+
+    Generates a known sine on the NI 9260 and captures it on the wired NI 9215
+    AI channel, proving the end-to-end signal path.  IEPE is OFF (voltage
+    channel).  Discard-first-read + settle per the pacing rules.  Skips unless
+    both the ``ao`` and ``sar`` roles are present and physically wired
+    (9260 ao0 -> 9215 ai0).
+    """
+
+    def test_loopback_sine_rms_and_frequency(self, hw_roles) -> None:
+        """A +-2 V / 50 Hz sine reads back at ~1.414 Vrms, dominant bin 50 Hz."""
+        ao_dev = hw_roles.get("ao")
+        sar_dev = hw_roles.get("sar")
+        if ao_dev is None or sar_dev is None:
+            pytest.skip("Loopback requires NI 9260 (ao) + NI 9215 (sar)")
+
+        from nidaqwrapper import AITask, AOTask
+
+        rate = AO_SAMPLE_RATE  # 25600, valid on both modules
+        amp = 2.0              # 2 V peak (1.41 Vrms) — well under 9260 ±4.242 V
+        freq = 50              # 50 integer cycles in a 1 s buffer
+        n_buf = rate
+        n_acq = 4096
+
+        t = np.arange(n_buf) / rate
+        sine = (amp * np.sin(2 * np.pi * freq * t)).reshape(-1, 1)
+
+        ao = AOTask("hw_lb_ao", sample_rate=rate, samples_per_channel=n_buf)
+        ai = AITask("hw_lb_ai", sample_rate=rate)
+        try:
+            ao.add_channel(
+                "out", device=ao_dev, channel_ind=0,
+                min_val=-AO_VOLTAGE_RANGE, max_val=AO_VOLTAGE_RANGE,
+            )
+            ao.configure()
+            ao.generate(sine)        # auto-starts, regenerates continuously
+            time.sleep(0.2)          # delta-sigma group delay + settle
+
+            ai.add_channel("in", device=sar_dev, channel_ind=0, units="V")
+            ai.configure()
+            ai.start()
+            time.sleep(0.1)
+            ai.acquire(n_acq)        # discard first read
+            time.sleep(0.2)
+            data = ai.acquire(n_acq)
+
+            assert data.shape == (n_acq, 1)
+            x = data.reshape(-1)
+            ac_rms = float(np.std(x))            # AC RMS (demeaned)
+            expected_rms = amp / np.sqrt(2)      # 1.414 V
+            assert abs(ac_rms - expected_rms) / expected_rms <= 0.10, (
+                f"AC-RMS {ac_rms:.4f} V vs expected {expected_rms:.4f} V"
+            )
+
+            # Dominant FFT bin (hann-windowed, DC removed)
+            win = np.hanning(n_acq)
+            spec = np.abs(np.fft.rfft((x - x.mean()) * win))
+            spec[0] = 0.0
+            bin_hz = rate / n_acq
+            peak_hz = int(np.argmax(spec)) * bin_hz
+            assert abs(peak_hz - freq) <= 2 * bin_hz, (
+                f"Dominant bin {peak_hz:.1f} Hz vs expected {freq} Hz"
+            )
+        finally:
+            try:
+                ao.stop()
+            except Exception:
+                pass
+            ao.clear_task()
+            ai.clear_task()
+
+
+class TestAITaskFiniteMode:
+    """AITask finite mode returns exactly N samples."""
+
+    def test_finite_returns_exact_sample_count(self) -> None:
+        """configure(sample_mode='finite', samples_per_channel=N) -> (N, 1)."""
+        if AI_DEVICE is None:
+            pytest.skip("No SAR AI device available")
+
+        from nidaqwrapper import AITask
+
+        n = 2048
+        task = AITask("hw_finite_ai", sample_rate=AI_SAMPLE_RATE)
+        try:
+            task.add_channel("v0", device=AI_DEVICE, channel_ind=0, units="V")
+            task.configure(sample_mode="finite", samples_per_channel=n)
+            task.start()
+            data = task.acquire(None)  # finite blocks and returns exactly N
+            assert data.shape == (n, 1), data.shape
+        finally:
+            task.clear_task()
+
+
+class TestDuplicateAOChannel:
+    """Issue #6: duplicate physical AO channel raises ValueError on hardware."""
+
+    def test_duplicate_physical_ao_raises_value_error(self) -> None:
+        """Adding the same physical AO channel twice -> ValueError (-200371)."""
+        if AO_DEVICE is None:
+            pytest.skip("No AO device available")
+
+        from nidaqwrapper import AOTask
+
+        task = AOTask("hw_dup_ao", sample_rate=AO_SAMPLE_RATE)
+        try:
+            task.add_channel(
+                "out0", device=AO_DEVICE, channel_ind=0,
+                min_val=-AO_VOLTAGE_RANGE, max_val=AO_VOLTAGE_RANGE,
+            )
+            with pytest.raises(ValueError):
+                task.add_channel(
+                    "out0b", device=AO_DEVICE, channel_ind=0,
+                    min_val=-AO_VOLTAGE_RANGE, max_val=AO_VOLTAGE_RANGE,
+                )
         finally:
             task.clear_task()

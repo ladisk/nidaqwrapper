@@ -453,3 +453,41 @@ def sim_device2_name():
         return SIMULATED_DEVICE2_NAME
     except ImportError:
         pytest.skip("nidaqmx not installed")
+
+
+# ===========================================================================
+# Hardware Role Resolution — real cDAQ rig (IEPE / SAR / AO), by product_type
+# ===========================================================================
+
+
+@pytest.fixture(scope="session")
+def hw_roles() -> dict[str, str]:
+    """Map module roles to live device names on a real cDAQ rig.
+
+    Resolves by ``product_type`` substring so the hardware suite auto-targets
+    the modules regardless of chassis enumeration (e.g. a USB cDAQ chassis
+    re-enumerating cDAQ5 -> cDAQ6).  Tests use ``hw_roles.get("sar")`` etc. and
+    skip cleanly when a role is absent.
+
+    Returns
+    -------
+    dict[str, str]
+        Keys among ``{"iepe", "sar", "ao"}`` mapped to device names:
+        ``"iepe"`` -> NI 9234, ``"sar"`` -> NI 9215, ``"ao"`` -> NI 9260.
+        Empty when no driver/devices are available.
+    """
+    roles: dict[str, str] = {}
+    try:
+        from nidaqwrapper import list_devices
+
+        for dev in list_devices():
+            product_type = dev["product_type"]
+            if "9234" in product_type:
+                roles["iepe"] = dev["name"]
+            elif "9215" in product_type:
+                roles["sar"] = dev["name"]
+            elif "9260" in product_type:
+                roles["ao"] = dev["name"]
+    except Exception:
+        pass
+    return roles

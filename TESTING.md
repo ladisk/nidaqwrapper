@@ -95,27 +95,28 @@ Simulated tests detect these issues without requiring physical hardware.
   (DaqError -89125) — full cross-device bursts are hardware-test only
 - cDAQ chassis/modules cannot be simulated on Linux
 
-### Hardware Tests (33 tests)
+### Hardware Tests (`tests/test_hardware.py`)
 
 **What they test:**
 - Real-world timing accuracy and buffer fill rates
-- Physical trigger signals and synchronization
-- Sensor data acquisition (accelerometers, voltage sources)
-- Multi-device coordination
-- Performance under load
+- IEPE/delta-sigma consecutive `add_channel()` (GitHub issue #5 — DaqError -201087)
+- AO→AI loopback signal-path validation (RMS / FFT)
+- Eager validation (duplicate physical AO → ValueError; over-range → -200077)
+- MultiHandler software-trigger acquisition
 
 **What hardware is needed:**
-- PCIe-6320 or similar multifunction DAQ device
-- cDAQ chassis with NI 9234 (IEPE accelerometer input) for some tests
-- Physical sensors and signal sources as specified in test docstrings
+- A cDAQ chassis (e.g. NI cDAQ-9174, USB) with these C-Series modules, resolved by
+  product type so the suite is enumeration-independent (cDAQ5 → cDAQ6 etc.):
+  - NI 9234 (IEPE / delta-sigma AI) — the issue-#5 gate
+  - NI 9215 (SAR AI)
+  - NI 9260 (delta-sigma AO)
+- Loopback wiring for the signal-path test: 9260 ao0 → 9215 ai0, 9260 ao1 → 9234 ai0.
+- No digital module is required; digital I/O tests skip when absent.
 
 **Running hardware tests:**
 ```bash
-# All hardware tests
-uv run pytest -m hardware -v
-
-# Specific hardware test file
-uv run pytest tests/test_hardware_ai.py -v
+# All hardware tests (serial, stop on first failure — recommended)
+uv run pytest tests/test_hardware.py -m hardware -x -p no:randomly -v
 ```
 
 ## Setting Up Simulated Devices
