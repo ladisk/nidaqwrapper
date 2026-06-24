@@ -6,9 +6,9 @@ nidaqwrapper uses a three-tier test strategy to balance speed, coverage, and har
 
 | Tier | Tests | Requirements | Purpose |
 |------|-------|-------------|---------|
-| **Mocked** | 905 | None | Fast unit tests with mocked nidaqmx for CI/CD |
+| **Mocked** | 916 | None | Fast unit tests with mocked nidaqmx for CI/CD |
 | **Simulated** | 81 + 1 xfail (+1 env-dependent skip) | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
-| **Hardware** | 33 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
+| **Hardware** | 36 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
 
 The simulated tier bridges the gap between mocked tests and hardware tests. All 4 bugs found during hardware testing were invisible to mocked tests because `MagicMock` auto-generates any attribute on access, masking real API mismatches. Simulated devices use the real NI-DAQmx driver with simulated hardware, catching API contract violations while remaining fast and deterministic.
 
@@ -35,7 +35,7 @@ The default `uv run pytest` excludes both simulated and hardware tests to ensure
 
 ## Test Tiers
 
-### Mocked Tests (905 tests)
+### Mocked Tests (916 tests)
 
 **What they test:**
 - Public API contracts (function signatures, return types)
@@ -95,7 +95,12 @@ Simulated tests detect these issues without requiring physical hardware.
   (DaqError -89125) — full cross-device bursts are hardware-test only
 - cDAQ chassis/modules cannot be simulated on Linux
 
-### Hardware Tests (`tests/test_hardware.py`)
+### Hardware Tests (`tests/test_hardware.py`, `tests/test_hardware_task_input.py`)
+
+The hardware tier spans two files: `tests/test_hardware.py` (the consolidated,
+product-type-resolved suite — IEPE/SAR/AO rig) and the older
+`tests/test_hardware_task_input.py` (task-input lifecycle on real hardware).
+Both are `@pytest.mark.hardware` and run together under `-m hardware`.
 
 **What they test:**
 - Real-world timing accuracy and buffer fill rates
@@ -115,8 +120,8 @@ Simulated tests detect these issues without requiring physical hardware.
 
 **Running hardware tests:**
 ```bash
-# All hardware tests (serial, stop on first failure — recommended)
-uv run pytest tests/test_hardware.py -m hardware -x -p no:randomly -v
+# All hardware tests across both files (serial, stop on first failure — recommended)
+uv run pytest -m hardware -x -p no:randomly -v
 ```
 
 ## Setting Up Simulated Devices
@@ -294,7 +299,7 @@ Example:
 ```python
 def test_ai_task_configuration(mock_task):
     task = AITask('test_task', sample_rate=25600)
-    task.add_channel('ch0', device_ind=0, channel_ind=0, units='V')
+    task.add_channel('ch0', device='Dev1', channel_ind=0, units='V')
     task.configure()
     assert task.task_name == 'test_task'
     assert task.sample_rate == 25600
@@ -312,24 +317,25 @@ Use the `@pytest.mark.simulated` decorator and fixtures from `tests/conftest.py`
 
 Example:
 ```python
+import numpy as np
 import pytest
 from nidaqwrapper import AITask
 
 @pytest.mark.simulated
-def test_ai_task_read(sim_device_index):
+def test_ai_task_read(simulated_device_name):
     task = AITask('sim_test', sample_rate=10000)
-    task.add_channel('ch0', device_ind=sim_device_index, channel_ind=0, units='V')
+    task.add_channel('ch0', device=simulated_device_name, channel_ind=0, units='V')
     task.configure()
     task.start()
     data = task.acquire(n_samples=100)
-    assert data.shape == (1, 100)  # 1 channel, 100 samples
+    assert data.shape == (100, 1)  # 100 samples, 1 channel
     assert data.dtype == np.float64
     task.clear_task()
 ```
 
 ### Hardware Tests
 
-Location: `tests/test_hardware_<topic>.py`
+Location: `tests/test_hardware.py`
 
 Use the `@pytest.mark.hardware` decorator. Clearly document required hardware in the test docstring.
 
@@ -347,12 +353,12 @@ def test_accelerometer_acquisition():
     - Accelerometer connected to channel 0
     """
     task = AITask('accel_test', sample_rate=25600)
-    task.add_channel('accel', device_ind=1, channel_ind=0,
+    task.add_channel('accel', device='cDAQ1Mod1', channel_ind=0,
                      sensitivity=100, sensitivity_units='mV/g', units='g')
     task.configure()
     task.start()
     data = task.acquire(n_samples=1000)
-    assert data.shape == (1, 1000)
+    assert data.shape == (1000, 1)
     task.clear_task()
 ```
 

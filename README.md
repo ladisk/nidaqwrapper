@@ -186,16 +186,24 @@ sensitivity_units = "mV/g"
 units = "g"
 ```
 
-### Multi-task synchronized acquisition
+### Software-triggered acquisition (level trigger)
+
+`set_trigger()` arms a software level trigger on a **single** input task
+(software triggering reads one task sequentially; use a hardware trigger for
+synchronized multi-task acquisition — see the next section):
 
 ```python
-from nidaqwrapper import MultiHandler
+from nidaqwrapper import AITask, MultiHandler
+
+task = AITask('vibration', sample_rate=25600)
+task.add_channel('ch0', device='cDAQ1Mod1', channel_ind=0,
+                 sensitivity=100, sensitivity_units='mV/g', units='g')
 
 adv = MultiHandler()
-adv.configure(input_tasks=[task1, task2])
+adv.configure(input_tasks=[task])
 adv.connect()
 adv.set_trigger(n_samples=25600, trigger_channel=0, trigger_level=0.5)
-data = adv.acquire()
+data = adv.acquire()   # {channel_name: ndarray, 'time': ndarray}
 adv.disconnect()
 ```
 
@@ -270,7 +278,7 @@ raw_task.timing.cfg_samp_clk_timing(rate=25600)
 
 wrapped = AITask.from_task(raw_task)
 # Use wrapped task with DAQHandler or read directly
-data = wrapped.acquire()  # shape: (n_channels, n_samples)
+data = wrapped.acquire()  # shape: (n_samples, n_channels)
 raw_task.close()  # Caller retains ownership
 ```
 
@@ -333,7 +341,7 @@ nidaqwrapper uses a three-tier test strategy:
 | Simulated | `uv run pytest -m simulated -v` | NI-DAQmx driver + simulated device |
 | Hardware | `uv run pytest -m hardware -v` | Physical NI hardware |
 
-The mocked tier (663 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
+The mocked tier (916 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
 
 See [TESTING.md](TESTING.md) for detailed setup instructions, troubleshooting, and how to configure simulated devices.
 
