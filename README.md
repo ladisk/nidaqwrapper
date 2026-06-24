@@ -242,7 +242,9 @@ fires; `is_running()` and `check_state()` support watchdog-style health polling.
 > clock reads back its timebase terminal, a slave the exported sample-clock terminal)
 > produce a `UserWarning` from `MultiHandler.configure()` instead of failing
 > validation — verify the clock wiring matches the warning. Mismatched sample rates
-> or samples-per-channel still fail validation.
+> or samples-per-channel still fail validation. The clock-source readback is
+> best-effort: on real hardware the source is only readable once a task is reserved,
+> so when it cannot be read `configure()` simply skips the warning and still succeeds.
 
 ### Context manager (automatic cleanup)
 

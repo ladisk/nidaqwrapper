@@ -610,6 +610,47 @@ class TestValidateTiming:
         assert "'MasterAI': '/SimDev1/ai/SampleClockTimebase'" in msg
         assert "'SlaveDI': '/SimDev1/ai/SampleClock'" in msg
 
+    def test_unreadable_clock_source_does_not_raise(self, adv, advanced_module):
+        """7.2c Hardware-only (cdaq6-hardware-validation): on real hardware
+        ``samp_clk_src`` is only readable while the task is reserved/committed/
+        running — an un-reserved task raises DaqError -200983.  The source
+        readback is best-effort (it only feeds the clock-source warning), so a
+        readback error MUST degrade to "skip the warning": equal rate and
+        samples-per-channel still return True, with no exception and no
+        UserWarning.  Reproduces the F2 failure found on the cDAQ6 rig where
+        MultiHandler.configure() of two matched-rate AI tasks raised -200983.
+        """
+        DaqError = advanced_module.DaqError
+
+        class _RaisingTiming:
+            """Timing whose samp_clk_src getter raises, like an un-reserved
+            real task; rate/samples remain readable (they have no such
+            restriction on hardware)."""
+
+            samp_clk_rate = 25600.0
+            samp_quant_samp_per_chan = 25600
+
+            @property
+            def samp_clk_src(self):
+                err = DaqError(
+                    "You only can get the specified property while the task "
+                    "is reserved, committed or while the task is running.",
+                    -200983,
+                )
+                err.error_code = -200983  # match real DaqError / file convention
+                raise err
+
+        t1 = _make_nidaqmx_task(
+            name="AI0", samp_clk_src="OnboardClock",
+            samp_clk_rate=25600.0, samp_quant_samp_per_chan=25600,
+        )
+        t2 = _make_nidaqmx_task(name="AI1")
+        t2.timing = _RaisingTiming()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning becomes an error
+            assert adv._validate_timing([t1, t2]) is True
+
     def test_mismatching_source_and_rate_returns_false(self, adv):
         """7.2b Source mismatch combined with rate mismatch still hard-fails:
         the relaxation must not let a warning short-circuit the rate check."""

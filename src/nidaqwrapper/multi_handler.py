@@ -1026,7 +1026,16 @@ class MultiHandler:
         if len(rates) > 1 or len(samples) > 1:
             return False
 
-        sources = [task.timing.samp_clk_src for task in tasks]
+        # The sample-clock source readback is best-effort: it only feeds the
+        # mismatch warning below. On real hardware ``samp_clk_src`` is only
+        # gettable while a task is reserved/committed/running — an un-reserved
+        # task raises DaqError -200983 (invisible on simulated devices, which
+        # permit the read). Hard validation (rate, samples) is already done, so
+        # an unreadable source degrades to "skip the warning", never an error.
+        try:
+            sources = [task.timing.samp_clk_src for task in tasks]
+        except DaqError:
+            sources = []
         if len(set(sources)) > 1:
             detail = ", ".join(
                 f"{task.name!r}: {source!r}"
