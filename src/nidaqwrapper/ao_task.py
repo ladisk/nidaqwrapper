@@ -54,6 +54,7 @@ except ImportError:
     DaqError = Exception  # type: ignore[misc,assignment]
 
 from .base_task import BaseTask
+from .utils import _resolve_system
 
 # Sentinel for _apply_timing() parameters — distinguishes "not passed,
 # use the stored attribute" from an explicit ``None`` candidate value.
@@ -78,6 +79,13 @@ class AOTask(BaseTask):
     samples_per_channel : int, optional
         Buffer size per channel.  Defaults to ``5 * int(sample_rate)``
         (5 seconds of buffer).
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the task is created on the NI gRPC Device Server
+        described by these options rather than by a locally-installed
+        NI-DAQmx driver, and device discovery is served by the same
+        server.  ``session_name`` must be either ``""`` or equal to
+        *task_name*, a restriction imposed by nidaqmx itself.  Defaults
+        to ``None``, meaning the local driver.
 
     Raises
     ------
@@ -93,7 +101,10 @@ class AOTask(BaseTask):
         task_name: str,
         sample_rate: float,
         samples_per_channel: int | None = None,
+        *,
+        grpc_options: Any = None,
     ) -> None:
+        self.grpc_options = grpc_options
         self.task_name = task_name
         self.sample_rate = sample_rate
 
@@ -109,7 +120,7 @@ class AOTask(BaseTask):
         self.clock_source: str | None = None
 
         # Discover connected devices
-        system = nidaqmx.system.System.local()
+        system = _resolve_system(grpc_options)
         self.device_list: list[str] = [dev.name for dev in system.devices]
         self.device_product_type: list[str] = [
             dev.product_type for dev in system.devices
@@ -123,7 +134,9 @@ class AOTask(BaseTask):
             )
 
         # Create the nidaqmx task immediately — it is the single source of truth
-        self.task = nidaqmx.task.Task(new_task_name=task_name)
+        self.task = nidaqmx.task.Task(
+            new_task_name=task_name, grpc_options=grpc_options
+        )
 
         # Track ownership — True when we created the task, False when wrapping external
         self._owns_task = True
@@ -446,7 +459,9 @@ class AOTask(BaseTask):
         pathlib.Path(path).write_text("\n".join(lines), encoding="utf-8")
 
     @classmethod
-    def from_config(cls, path: str | pathlib.Path) -> AOTask:
+    def from_config(
+        cls, path: str | pathlib.Path, grpc_options: Any = None
+    ) -> AOTask:
         """Create an :class:`AOTask` from a TOML configuration file.
 
         Reads the TOML file produced by :meth:`save_config`, constructs
@@ -457,6 +472,10 @@ class AOTask(BaseTask):
         ----------
         path : str or pathlib.Path
             Path to a TOML file.
+        grpc_options : nidaqmx.GrpcSessionOptions, optional
+            Forwarded to the constructor, so the task is created on the NI
+            gRPC Device Server described by these options instead of by the
+            local NI-DAQmx driver.  Defaults to ``None`` (local driver).
 
         Returns
         -------
@@ -502,6 +521,7 @@ class AOTask(BaseTask):
             task_section["name"],
             sample_rate=task_section["sample_rate"],
             samples_per_channel=samples_per_channel,
+            grpc_options=grpc_options,
         )
 
         for ch in data.get("channels", []):
@@ -539,6 +559,9 @@ class AOTask(BaseTask):
         task : nidaqmx.task.Task
             An existing nidaqmx Task object with AO channels configured.
             Timing configuration and task state are preserved.
+            The wrapper inherits the task's transport: a task built with
+            ``grpc_options`` keeps using the same NI gRPC Device Server
+            for later device queries.
         take_ownership : bool, optional
             If ``True``, the wrapper takes ownership of the task and all
             mutating methods (:meth:`add_channel`, :meth:`configure`,
@@ -595,6 +618,10 @@ class AOTask(BaseTask):
 
         # Create instance without calling __init__
         instance = object.__new__(cls)
+
+        # Inherit the wrapped task's transport so later device
+        # queries go to the same place the task itself does.
+        instance.grpc_options = getattr(task, "_grpc_options", None)
 
         # Populate attributes from the live task
         instance.task = task

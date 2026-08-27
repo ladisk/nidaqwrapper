@@ -266,7 +266,7 @@ class TestAITaskConstructor:
             from nidaqwrapper.ai_task import AITask
             AITask("vibration_test", sample_rate=25600)
 
-        mock_cls.assert_called_once_with(new_task_name="vibration_test")
+        mock_cls.assert_called_once_with(new_task_name="vibration_test", grpc_options=None)
 
     def test_task_attribute_set_immediately(self, mock_system, mock_constants):
         """self.task is set to the nidaqmx.Task in the constructor."""
@@ -2053,7 +2053,7 @@ units = "g"
             from nidaqwrapper.ai_task import AITask
             task = AITask.from_config(path)
 
-        mock_cls.assert_called_once_with(new_task_name="vibration_test")
+        mock_cls.assert_called_once_with(new_task_name="vibration_test", grpc_options=None)
         assert task.sample_rate == 25600
 
     def test_resolves_device_alias(self, mock_system, mock_constants, tmp_path):
@@ -2501,7 +2501,7 @@ class TestConfigRoundtrip:
             loaded = AITask.from_config(path)
 
         # Verify the loaded task matches the original
-        mock_cls.assert_called_once_with(new_task_name="test")
+        mock_cls.assert_called_once_with(new_task_name="test", grpc_options=None)
         assert loaded.sample_rate == 25600
         mock_ni_task2.ai_channels.add_ai_accel_chan.assert_called_once()
         kwargs = mock_ni_task2.ai_channels.add_ai_accel_chan.call_args.kwargs
@@ -2942,7 +2942,7 @@ class TestFromName:
             from nidaqwrapper.ai_task import AITask
             task = AITask.from_name("MaxTask")
 
-        mock_get.assert_called_once_with("MaxTask")
+        mock_get.assert_called_once_with("MaxTask", None)
         assert isinstance(task, AITask)
         assert task.task is mock_ni_task
         assert task.task_name == "MaxTask"
@@ -3546,3 +3546,147 @@ class TestFromTaskSyncAttributes:
 
         assert task.clock_source is None
         assert any("clock" in str(x.message).lower() for x in w)
+
+
+class TestAITaskGrpcOptions:
+    """AITask can be built against a remote NI gRPC Device Server."""
+
+    def test_default_uses_the_local_driver(self, mock_system, mock_constants):
+        """Without grpc_options the local system is resolved."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system) as res,
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()),
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+        ):
+            ai_mod.AITask("local_task", sample_rate=25600)
+
+        res.assert_called_once_with(None)
+
+    def test_options_resolve_the_remote_system(self, mock_system, mock_constants):
+        """grpc_options are handed to the system resolver."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system) as res,
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()),
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+        ):
+            ai_mod.AITask("remote_task", sample_rate=25600, grpc_options=opts)
+
+        res.assert_called_once_with(opts)
+
+    def test_options_forwarded_to_the_nidaqmx_task(self, mock_system, mock_constants):
+        """The underlying nidaqmx.Task is created on the same transport."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system),
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()) as mock_cls,
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+        ):
+            ai_mod.AITask("remote_task", sample_rate=25600, grpc_options=opts)
+
+        mock_cls.assert_called_once_with(
+            new_task_name="remote_task", grpc_options=opts
+        )
+
+    def test_options_stored_on_the_instance(self, mock_system, mock_constants):
+        """The transport is introspectable after construction."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system),
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()),
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+        ):
+            task = ai_mod.AITask("remote_task", sample_rate=25600,
+                                 grpc_options=opts)
+
+        assert task.grpc_options is opts
+
+    def test_options_are_keyword_only(self, mock_system, mock_constants):
+        """grpc_options cannot be passed positionally by mistake."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system),
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()),
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+            pytest.raises(TypeError),
+        ):
+            ai_mod.AITask("remote_task", 25600, MagicMock())
+
+    def test_remote_device_list_comes_from_the_remote_system(
+        self, mock_system, mock_constants
+    ):
+        """Device discovery follows the transport, not the local driver."""
+        import nidaqwrapper.ai_task as ai_mod
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(devices=[("cDAQ9Mod2", "NI 9232")], task_names=[])
+        with (
+            patch.object(ai_mod, "_resolve_system", return_value=system),
+            patch("nidaqwrapper.ai_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()),
+            patch("nidaqwrapper.ai_task.UNITS", MOCK_UNITS),
+            patch("nidaqwrapper.ai_task.constants", mock_constants),
+        ):
+            task = ai_mod.AITask("remote_task", sample_rate=25600,
+                                 grpc_options=opts)
+
+        assert task.device_list == ["cDAQ9Mod2"]
+        assert task.device_product_type == ["NI 9232"]
+
+    @staticmethod
+    def _external_task(grpc_options):
+        """A minimal externally-created AI task on the given transport."""
+        raw = MagicMock()
+        raw.name = "external_task"
+        raw.timing.samp_clk_rate = 51200
+        raw.timing.samp_quant_samp_mode = "CONTINUOUS"
+        mock_ch = MagicMock()
+        mock_ch.name = "ai0"
+        raw.ai_channels = [mock_ch]
+        raw.channel_names = ["ai0"]
+        raw.is_task_done.return_value = True
+        raw._grpc_options = grpc_options
+        return raw
+
+    def test_from_task_inherits_the_transport(self, mock_constants):
+        """Wrapping a remote nidaqmx task keeps its server."""
+        from nidaqwrapper.ai_task import AITask
+
+        opts = MagicMock(name="grpc_options")
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            wrapped = AITask.from_task(self._external_task(opts))
+
+        assert wrapped.grpc_options is opts
+
+    def test_from_task_on_a_local_task_has_no_transport(self, mock_constants):
+        """A locally-created task wraps with grpc_options None."""
+        from nidaqwrapper.ai_task import AITask
+
+        with patch("nidaqwrapper.ai_task.constants", mock_constants):
+            wrapped = AITask.from_task(self._external_task(None))
+
+        assert wrapped.grpc_options is None

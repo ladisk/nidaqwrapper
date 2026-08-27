@@ -300,7 +300,7 @@ class BaseTask:
     # -- Class methods -------------------------------------------------------
 
     @classmethod
-    def from_name(cls, task_name: str) -> BaseTask:
+    def from_name(cls, task_name: str, grpc_options: Any = None) -> BaseTask:
         """Load an NI MAX task by name and wrap it.
 
         Looks up the task in NI MAX via
@@ -313,6 +313,10 @@ class BaseTask:
         ----------
         task_name : str
             The name of the task as saved in NI MAX.
+        grpc_options : nidaqmx.GrpcSessionOptions, optional
+            Forwarded to the constructor, so the task is created on the NI
+            gRPC Device Server described by these options instead of by the
+            local NI-DAQmx driver.  Defaults to ``None`` (local driver).
 
         Returns
         -------
@@ -339,7 +343,7 @@ class BaseTask:
         >>> task.clear_task()
         """
         _require_nidaqmx()
-        loaded = get_task_by_name(task_name)
+        loaded = get_task_by_name(task_name, grpc_options)
         if loaded is None:
             raise RuntimeError(
                 f"Task '{task_name}' is already loaded by another process."

@@ -625,3 +625,105 @@ class TestUNITSReverse:
         sentinel = object()  # an unknown key not in UNITS_REVERSE
         result = UNITS_REVERSE.get(sentinel, "fallback")
         assert result == "fallback"
+
+
+class TestResolveSystem:
+    """``_resolve_system()`` picks the local or remote NI-DAQmx system."""
+
+    def test_none_returns_local_system(self):
+        """No grpc_options means the locally-installed driver."""
+        from nidaqwrapper.utils import _resolve_system
+
+        with patch("nidaqwrapper.utils.nidaqmx.system.System.local") as local:
+            assert _resolve_system(None) is local.return_value
+        local.assert_called_once_with()
+
+    def test_none_is_the_default(self):
+        """_resolve_system() with no argument is the local path."""
+        from nidaqwrapper.utils import _resolve_system
+
+        with patch("nidaqwrapper.utils.nidaqmx.system.System.local") as local:
+            assert _resolve_system() is local.return_value
+
+    def test_options_return_remote_system(self):
+        """grpc_options routes through System.remote()."""
+        from nidaqwrapper.utils import _resolve_system
+
+        opts = MagicMock(name="grpc_options")
+        with patch("nidaqwrapper.utils.nidaqmx.system.System.remote") as remote:
+            assert _resolve_system(opts) is remote.return_value
+        remote.assert_called_once_with(opts)
+
+    def test_options_do_not_touch_the_local_driver(self):
+        """The local driver is never consulted on the remote path."""
+        from nidaqwrapper.utils import _resolve_system
+
+        opts = MagicMock(name="grpc_options")
+        with (
+            patch("nidaqwrapper.utils.nidaqmx.system.System.remote"),
+            patch("nidaqwrapper.utils.nidaqmx.system.System.local") as local,
+        ):
+            _resolve_system(opts)
+        local.assert_not_called()
+
+
+class TestUtilsGrpcOptions:
+    """The public query helpers accept and forward ``grpc_options``."""
+
+    @pytest.mark.parametrize(
+        "func_name",
+        [
+            "system_info",
+            "list_tasks",
+            "get_connected_devices",
+            "list_devices",
+        ],
+    )
+    def test_helper_queries_the_remote_system(self, func_name, mock_system):
+        """Each helper resolves its system through the given options."""
+        import nidaqwrapper.utils as utils
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(task_names=["SavedTask"])
+        with patch.object(utils, "_resolve_system", return_value=system) as res:
+            getattr(utils, func_name)(opts)
+        res.assert_called_once_with(opts)
+
+    @pytest.mark.parametrize(
+        "func_name",
+        [
+            "system_info",
+            "list_tasks",
+            "get_connected_devices",
+            "list_devices",
+        ],
+    )
+    def test_helper_defaults_to_the_local_system(self, func_name, mock_system):
+        """Called with no options, each helper stays on the local driver."""
+        import nidaqwrapper.utils as utils
+
+        system = mock_system(task_names=["SavedTask"])
+        with patch.object(utils, "_resolve_system", return_value=system) as res:
+            getattr(utils, func_name)()
+        res.assert_called_once_with(None)
+
+    def test_get_task_by_name_forwards_options(self, mock_system):
+        """get_task_by_name() resolves its system through the options too."""
+        import nidaqwrapper.utils as utils
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(task_names=["SavedTask"])
+        with patch.object(utils, "_resolve_system", return_value=system) as res:
+            utils.get_task_by_name("SavedTask", opts)
+        res.assert_called_once_with(opts)
+
+    def test_list_devices_returns_remote_devices(self, mock_system):
+        """The remote system's devices are what actually come back."""
+        import nidaqwrapper.utils as utils
+
+        opts = MagicMock(name="grpc_options")
+        system = mock_system(devices=[("cDAQ9Mod1", "NI 9232")])
+        with patch.object(utils, "_resolve_system", return_value=system):
+            assert utils.list_devices(opts) == [
+                {"name": "cDAQ9Mod1", "product_type": "NI 9232"}
+            ]

@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 
 from .base_task import _SAMPLE_MODE_ATTR, BaseTask
-from .utils import UNITS, UNITS_REVERSE, _require_nidaqmx
+from .utils import UNITS, UNITS_REVERSE, _require_nidaqmx, _resolve_system
 
 try:
     import nidaqmx
@@ -63,6 +63,13 @@ class AITask(BaseTask):
         task in NI MAX.
     sample_rate : float
         Sampling rate in Hz.
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the task is created on the NI gRPC Device Server
+        described by these options rather than by a locally-installed
+        NI-DAQmx driver, and device discovery is served by the same
+        server.  ``session_name`` must be either ``""`` or equal to
+        *task_name*, a restriction imposed by nidaqmx itself.  Defaults
+        to ``None``, meaning the local driver.
 
     Raises
     ------
@@ -78,6 +85,17 @@ class AITask(BaseTask):
     ...                  sensitivity=100.0, sensitivity_units="mV/g",
     ...                  units="g")
     >>> task.start()
+
+    Driving hardware attached to another machine, through the NI gRPC
+    Device Server running there:
+
+    >>> import nidaqmx
+    >>> opts = nidaqmx.GrpcSessionOptions(grpc_channel, "vibration_test")
+    >>> task = AITask("vibration_test", sample_rate=25600, grpc_options=opts)
+    >>> task.add_channel("accel_x", device='cDAQ1Mod2', channel_ind=0,
+    ...                  sensitivity=100.0, sensitivity_units="mV/g",
+    ...                  units="g")
+    >>> task.start()
     """
 
     _channel_attr = "ai_channels"
@@ -87,14 +105,19 @@ class AITask(BaseTask):
         self,
         task_name: str,
         sample_rate: float,
+        *,
+        grpc_options: Any = None,
     ) -> None:
         _require_nidaqmx()
 
         self.task_name = task_name
         self.sample_rate = sample_rate
 
+        # Transport for this task: None means the local NI-DAQmx driver.
+        self.grpc_options = grpc_options
+
         # Device discovery
-        system = nidaqmx.system.System.local()
+        system = _resolve_system(grpc_options)
         self.device_list: list[str] = [d.name for d in system.devices]
         self.device_product_type: list[str] = [
             d.product_type for d in system.devices
@@ -116,7 +139,9 @@ class AITask(BaseTask):
         self.clock_source: str | None = None
 
         # Create the nidaqmx task immediately — it is the single source of truth
-        self.task = nidaqmx.task.Task(new_task_name=task_name)
+        self.task = nidaqmx.task.Task(
+            new_task_name=task_name, grpc_options=grpc_options
+        )
 
         # Ownership flag: True when this AITask created the nidaqmx.Task,
         # False when wrapping an externally-provided task via from_task().
@@ -766,7 +791,9 @@ class AITask(BaseTask):
         pathlib.Path(path).write_text("\n".join(lines), encoding="utf-8")
 
     @classmethod
-    def from_config(cls, path: str | pathlib.Path) -> AITask:
+    def from_config(
+        cls, path: str | pathlib.Path, grpc_options: Any = None
+    ) -> AITask:
         """Create an :class:`AITask` from a TOML configuration file.
 
         Reads the TOML file produced by :meth:`save_config`, constructs
@@ -777,6 +804,10 @@ class AITask(BaseTask):
         ----------
         path : str or pathlib.Path
             Path to a TOML file.
+        grpc_options : nidaqmx.GrpcSessionOptions, optional
+            Forwarded to the constructor, so the task is created on the NI
+            gRPC Device Server described by these options instead of by the
+            local NI-DAQmx driver.  Defaults to ``None`` (local driver).
 
         Returns
         -------
@@ -816,7 +847,11 @@ class AITask(BaseTask):
         task_section = data["task"]
         alias_to_name: dict[str, str] = data["devices"]
 
-        task = cls(task_section["name"], sample_rate=task_section["sample_rate"])
+        task = cls(
+            task_section["name"],
+            sample_rate=task_section["sample_rate"],
+            grpc_options=grpc_options,
+        )
 
         for ch in data.get("channels", []):
             alias = ch["device"]
@@ -872,6 +907,9 @@ class AITask(BaseTask):
         ----------
         task : nidaqmx.task.Task
             A pre-created nidaqmx Task object with at least one AI channel.
+            The wrapper inherits the task's transport: a task built with
+            ``grpc_options`` keeps using the same NI gRPC Device Server
+            for later device queries.
         take_ownership : bool, optional
             If ``True``, the wrapper takes ownership of the task and all
             mutating methods (add_channel, configure, start, clear_task)
@@ -922,6 +960,10 @@ class AITask(BaseTask):
 
         # Create instance without calling __init__ (use object.__new__)
         instance = object.__new__(cls)
+
+        # Inherit the wrapped task's transport so later device
+        # queries go to the same place the task itself does.
+        instance.grpc_options = getattr(task, "_grpc_options", None)
 
         # Populate all instance attributes by reading from the live task
         instance.device_list = [d.name for d in task.devices]
