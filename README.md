@@ -341,7 +341,7 @@ nidaqwrapper uses a three-tier test strategy:
 | Simulated | `uv run pytest -m simulated -v` | NI-DAQmx driver + simulated device |
 | Hardware | `uv run pytest -m hardware -v` | Physical NI hardware |
 
-The mocked tier (916 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
+The mocked tier (919 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
 
 See [TESTING.md](TESTING.md) for detailed setup instructions, troubleshooting, and how to configure simulated devices.
 

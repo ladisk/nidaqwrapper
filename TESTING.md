@@ -6,7 +6,7 @@ nidaqwrapper uses a three-tier test strategy to balance speed, coverage, and har
 
 | Tier | Tests | Requirements | Purpose |
 |------|-------|-------------|---------|
-| **Mocked** | 916 | None | Fast unit tests with mocked nidaqmx for CI/CD |
+| **Mocked** | 919 | None | Fast unit tests with mocked nidaqmx for CI/CD |
 | **Simulated** | 81 + 1 xfail (+1 env-dependent skip) | NI-DAQmx driver + simulated devices | Real driver API validation without physical hardware |
 | **Hardware** | 36 | Physical NI-DAQmx devices | Real-world timing, triggers, and signal validation |
 
@@ -35,7 +35,7 @@ The default `uv run pytest` excludes both simulated and hardware tests to ensure
 
 ## Test Tiers
 
-### Mocked Tests (916 tests)
+### Mocked Tests (919 tests)
 
 **What they test:**
 - Public API contracts (function signatures, return types)
