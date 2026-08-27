@@ -61,6 +61,7 @@ wrapper.disconnect()
 - **TOML configuration** -- `save_config()` / `from_config()` for portable, human-readable task definitions with device aliases
 - **Device discovery** -- `list_devices()`, `list_tasks()`, `get_connected_devices()` for hardware enumeration
 - **Raw task injection** -- `from_task()` on all task classes wraps pre-configured `nidaqmx.Task` objects
+- **Remote hardware** -- every task class and discovery helper takes `grpc_options`, so the DAQ hardware and NI-DAQmx driver can live on a different machine behind the [NI gRPC Device Server](https://github.com/ni/grpc-device)
 - **Factory classmethods** -- `from_name()` creates tasks from a saved NI MAX task name, `from_config()` from TOML
 - **System introspection** -- `system_info()` returns structured device/driver/task inventory
 - **Context manager support** -- automatic resource cleanup with `with` statements
@@ -282,6 +283,48 @@ data = wrapped.acquire()  # shape: (n_samples, n_channels)
 raw_task.close()  # Caller retains ownership
 ```
 
+### Remote hardware over gRPC
+
+NI-DAQmx only ships drivers for a handful of Linux distributions, and the
+driver must run on the machine the hardware is plugged into.  When that is not
+the machine you write code on, run NI's
+[gRPC Device Server](https://github.com/ni/grpc-device) next to the hardware
+and point a task at it.  Nothing else changes -- `add_channel()`,
+`configure()`, `acquire()` and the handlers all behave the same.
+
+```python
+import grpc
+import nidaqmx
+from nidaqwrapper import AITask
+from nidaqwrapper.utils import list_devices
+
+channel = grpc.insecure_channel('192.168.122.50:31763')
+
+# Discovery: an empty session name is required for system-level calls
+list_devices(nidaqmx.GrpcSessionOptions(channel, ''))
+# [{'name': 'cDAQ1Mod2', 'product_type': 'NI 9232 (BNC)'}]
+
+# Tasks: the session name must match the task name
+opts = nidaqmx.GrpcSessionOptions(channel, 'vibration_test')
+
+task = AITask('vibration_test', sample_rate=25600, grpc_options=opts)
+task.add_channel('accel_x', device='cDAQ1Mod2', channel_ind=0,
+                 sensitivity=100.0, sensitivity_units='mV/g', units='g')
+task.configure(sample_mode='continuous')
+task.start()
+data = task.acquire(2560)  # shape: (2560, 1)
+task.clear_task()
+```
+
+Two constraints are worth knowing.  nidaqmx requires the gRPC session name to
+be either empty or exactly equal to the task name, so pass `''` for discovery
+helpers and the task name for tasks.  And the duplicate-task-name guard reads
+NI MAX, which does not exist on Linux, so it is inert over gRPC -- name
+collisions surface from the driver instead.
+
+Omit `grpc_options` (or pass `None`) and everything runs against the local
+driver exactly as before.
+
 ## API Reference
 
 ### Task Classes
@@ -341,7 +384,7 @@ nidaqwrapper uses a three-tier test strategy:
 | Simulated | `uv run pytest -m simulated -v` | NI-DAQmx driver + simulated device |
 | Hardware | `uv run pytest -m hardware -v` | Physical NI hardware |
 
-The mocked tier (919 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
+The mocked tier (957 tests) runs by default and requires no NI-DAQmx driver. The simulated tier uses the real driver with simulated devices to catch API contract violations. The hardware tier validates real-world timing and physical signals.
 
 See [TESTING.md](TESTING.md) for detailed setup instructions, troubleshooting, and how to configure simulated devices.
 

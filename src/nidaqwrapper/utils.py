@@ -89,16 +89,43 @@ def _require_nidaqmx() -> None:
         )
 
 
+def _resolve_system(grpc_options: Any = None) -> Any:
+    """Return the NI-DAQmx system object for the requested transport.
+
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When ``None`` (default) the locally-installed NI-DAQmx driver is
+        used.  When given, the system is resolved through the NI gRPC
+        Device Server described by these options, so the driver may live
+        on another machine.
+
+    Returns
+    -------
+    nidaqmx.system.System
+        A local or remote system object.
+    """
+    if grpc_options is None:
+        return nidaqmx.system.System.local()
+    return nidaqmx.system.System.remote(grpc_options)
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def system_info() -> dict[str, Any]:
+def system_info(grpc_options: Any = None) -> dict[str, Any]:
     """Return NI system discovery information.
 
     Aggregates connected device details and saved NI MAX task names
     into a single dict for convenient discovery in notebooks and scripts.
+
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
 
     Returns
     -------
@@ -127,7 +154,7 @@ def system_info() -> dict[str, Any]:
     ['MyInputTask', 'MyOutputTask']
     """
     _require_nidaqmx()
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
 
     devices = []
     for dev in system.devices:
@@ -146,8 +173,15 @@ def system_info() -> dict[str, Any]:
     return {"devices": devices, "tasks": list(system.tasks.task_names)}
 
 
-def list_tasks() -> list[str]:
+def list_tasks(grpc_options: Any = None) -> list[str]:
     """List all tasks saved in NI MAX.
+
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
 
     Returns
     -------
@@ -168,11 +202,13 @@ def list_tasks() -> list[str]:
     []
     """
     _require_nidaqmx()
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
     return list(system.tasks.task_names)
 
 
-def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
+def get_task_by_name(
+    name: str, grpc_options: Any = None
+) -> nidaqmx.task.Task | None:
     """Load a pre-configured NI-DAQmx task from NI MAX by name.
 
     Iterates over tasks saved in NI MAX, matches by name, and calls
@@ -191,6 +227,10 @@ def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
     ----------
     name : str
         The exact name of the task as saved in NI MAX.
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
 
     Returns
     -------
@@ -232,7 +272,7 @@ def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
     because NI MAX does not permit blank task names.
     """
     _require_nidaqmx()
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
 
     # Collect available names up front so the KeyError message is informative.
     # The iterator is recreated for each call to system.tasks because the mock
@@ -262,12 +302,19 @@ def get_task_by_name(name: str) -> nidaqmx.task.Task | None:
     )
 
 
-def get_connected_devices() -> set[str]:
+def get_connected_devices(grpc_options: Any = None) -> set[str]:
     """Return the set of currently connected NI-DAQmx device names.
 
     Queries the local NI-DAQmx system and returns only the device name
     strings, without product type metadata.  Useful when the caller needs
     a fast membership check (``"cDAQ1Mod1" in get_connected_devices()``).
+
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
 
     Returns
     -------
@@ -293,12 +340,19 @@ def get_connected_devices() -> set[str]:
     list_devices : Returns full device info dicts including product type.
     """
     _require_nidaqmx()
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
     return {dev.name for dev in system.devices}
 
 
-def list_devices() -> list[dict[str, str]]:
+def list_devices(grpc_options: Any = None) -> list[dict[str, str]]:
     """List all NI-DAQmx compatible devices connected to the system.
+
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
 
     Returns
     -------
@@ -324,7 +378,7 @@ def list_devices() -> list[dict[str, str]]:
     []
     """
     _require_nidaqmx()
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
     return [
         {"name": dev.name, "product_type": dev.product_type}
         for dev in system.devices

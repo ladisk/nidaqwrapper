@@ -131,7 +131,7 @@ def _build_di(
     stack.enter_context(
         patch(
             "nidaqwrapper.digital._expand_port_to_line_range",
-            side_effect=lambda lines: lines,
+            side_effect=lambda lines, *a: lines,
         )
     )
 
@@ -184,7 +184,7 @@ def _build_do(
     stack.enter_context(
         patch(
             "nidaqwrapper.digital._expand_port_to_line_range",
-            side_effect=lambda lines: lines,
+            side_effect=lambda lines, *a: lines,
         )
     )
 
@@ -222,7 +222,7 @@ class TestDITaskConstructor:
 
             DITask("switches", sample_rate=None)
 
-        mock_cls.assert_called_once_with(new_task_name="switches")
+        mock_cls.assert_called_once_with(new_task_name="switches", grpc_options=None)
 
     def test_task_attribute_set_immediately(self, mock_system, mock_constants):
         """self.task is set to the nidaqmx.Task in the constructor."""
@@ -348,7 +348,7 @@ class TestDITaskAddChannel:
             di = DITask("test_expand")
             di.add_channel("port0", lines="Dev1/port0")
 
-        mock_expand.assert_called_once_with("Dev1/port0")
+        mock_expand.assert_called_once_with("Dev1/port0", None)
         # The expanded result is forwarded to nidaqmx
         kwargs = mock_ni_task.di_channels.add_di_chan.call_args.kwargs
         assert kwargs["lines"] == "Dev1/port0/line0:7"
@@ -370,7 +370,7 @@ class TestDITaskAddChannel:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ) as mock_expand,
         ):
             from nidaqwrapper.digital import DITask
@@ -380,7 +380,7 @@ class TestDITaskAddChannel:
 
         # Expansion function was called — it's called for all specs, but returns
         # the spec unchanged when '/line' is present (handled internally)
-        mock_expand.assert_called_once_with("Dev1/port0/line0:3")
+        mock_expand.assert_called_once_with("Dev1/port0/line0:3", None)
 
     def test_duplicate_name_raises(self, mock_system, mock_constants):
         """Adding two channels with the same name raises ValueError."""
@@ -900,7 +900,7 @@ class TestDITaskSaveConfig:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -946,14 +946,14 @@ lines = "Dev1/port0/line0:3"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
 
             di = DITask.from_config(path)
 
-        mock_cls.assert_called_once_with(new_task_name="switches")
+        mock_cls.assert_called_once_with(new_task_name="switches", grpc_options=None)
         assert di.task_name == "switches"
 
     def test_adds_channels(self, mock_system, mock_constants, tmp_path):
@@ -989,7 +989,7 @@ lines = "Dev1/port1/line0:7"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -1028,7 +1028,7 @@ lines = "Dev1/port0/line0"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -1101,7 +1101,7 @@ class TestDITaskConfigRoundtrip:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -1141,7 +1141,7 @@ class TestDITaskConfigRoundtrip:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -1276,7 +1276,7 @@ class TestDITaskFromTask:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DITask
@@ -1457,7 +1457,7 @@ class TestDOTaskConstructor:
 
             DOTask("leds", sample_rate=None)
 
-        mock_cls.assert_called_once_with(new_task_name="leds")
+        mock_cls.assert_called_once_with(new_task_name="leds", grpc_options=None)
 
     def test_task_attribute_set_immediately(self, mock_system, mock_constants):
         """self.task is set to the nidaqmx.Task in the constructor."""
@@ -1582,7 +1582,7 @@ class TestDOTaskAddChannel:
             do = DOTask("test_expand")
             do.add_channel("port1", lines="Dev1/port1")
 
-        mock_expand.assert_called_once_with("Dev1/port1")
+        mock_expand.assert_called_once_with("Dev1/port1", None)
         kwargs = mock_ni_task.do_channels.add_do_chan.call_args.kwargs
         assert kwargs["lines"] == "Dev1/port1/line0:7"
 
@@ -2098,7 +2098,7 @@ class TestDOTaskSaveConfig:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2144,14 +2144,14 @@ lines = "Dev1/port1/line0:3"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
 
             do = DOTask.from_config(path)
 
-        mock_cls.assert_called_once_with(new_task_name="leds")
+        mock_cls.assert_called_once_with(new_task_name="leds", grpc_options=None)
         assert do.task_name == "leds"
 
     def test_adds_channels(self, mock_system, mock_constants, tmp_path):
@@ -2187,7 +2187,7 @@ lines = "Dev1/port2/line0:7"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2226,7 +2226,7 @@ lines = "Dev1/port1/line0"
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2299,7 +2299,7 @@ class TestDOTaskConfigRoundtrip:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2339,7 +2339,7 @@ class TestDOTaskConfigRoundtrip:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2446,7 +2446,7 @@ class TestDOTaskFromTask:
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch(
                 "nidaqwrapper.digital._expand_port_to_line_range",
-                side_effect=lambda lines: lines,
+                side_effect=lambda lines, *a: lines,
             ),
         ):
             from nidaqwrapper.digital import DOTask
@@ -2666,7 +2666,7 @@ class TestDITaskFromTaskTakeOwnership:
                   return_value=system),
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch("nidaqwrapper.digital._expand_port_to_line_range",
-                  side_effect=lambda lines: lines),
+                  side_effect=lambda lines, *a: lines),
         ):
             from nidaqwrapper.digital import DITask
             task = DITask.from_task(ext, take_ownership=True)
@@ -2772,7 +2772,7 @@ class TestDOTaskFromTaskTakeOwnership:
                   return_value=system),
             patch("nidaqwrapper.digital.constants", mock_constants),
             patch("nidaqwrapper.digital._expand_port_to_line_range",
-                  side_effect=lambda lines: lines),
+                  side_effect=lambda lines, *a: lines),
         ):
             from nidaqwrapper.digital import DOTask
             task = DOTask.from_task(ext, take_ownership=True)
@@ -2849,7 +2849,7 @@ class TestFromNameDI:
             from nidaqwrapper.digital import DITask
             task = DITask.from_name("MaxDITask")
 
-        mock_get.assert_called_once_with("MaxDITask")
+        mock_get.assert_called_once_with("MaxDITask", None)
         assert isinstance(task, DITask)
         assert task.task is mock_ni_task
         assert task._owns_task is True
@@ -2910,7 +2910,7 @@ class TestFromNameDO:
             from nidaqwrapper.digital import DOTask
             task = DOTask.from_name("MaxDOTask")
 
-        mock_get.assert_called_once_with("MaxDOTask")
+        mock_get.assert_called_once_with("MaxDOTask", None)
         assert isinstance(task, DOTask)
         assert task.task is mock_ni_task
         assert task._owns_task is True
@@ -3491,3 +3491,88 @@ class TestDITaskFiniteAcquireContract:
 
         mt.read.assert_called_once_with(number_of_samples_per_channel=-1)
         assert result.shape == (4, 1)
+
+
+class TestDigitalGrpcOptions:
+    """DITask and DOTask can be built against a remote gRPC Device Server."""
+
+    def _construct(self, cls_name, mock_system, mock_constants, **kwargs):
+        import nidaqwrapper.digital as dig_mod
+
+        system = mock_system(task_names=[])
+        with (
+            patch.object(dig_mod, "_resolve_system", return_value=system) as res,
+            patch("nidaqwrapper.digital.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()) as mock_cls,
+            patch("nidaqwrapper.digital.constants", mock_constants),
+        ):
+            task = getattr(dig_mod, cls_name)("dio", sample_rate=1000, **kwargs)
+        return task, res, mock_cls
+
+    @pytest.mark.parametrize("cls_name", ["DITask", "DOTask"])
+    def test_default_uses_the_local_driver(self, cls_name, mock_system,
+                                           mock_constants):
+        """Without grpc_options the local system is resolved."""
+        _, res, _ = self._construct(cls_name, mock_system, mock_constants)
+        res.assert_called_once_with(None)
+
+    @pytest.mark.parametrize("cls_name", ["DITask", "DOTask"])
+    def test_options_resolve_the_remote_system(self, cls_name, mock_system,
+                                               mock_constants):
+        """grpc_options are handed to the system resolver."""
+        opts = MagicMock(name="grpc_options")
+        _, res, _ = self._construct(cls_name, mock_system, mock_constants,
+                                    grpc_options=opts)
+        res.assert_called_once_with(opts)
+
+    @pytest.mark.parametrize("cls_name", ["DITask", "DOTask"])
+    def test_options_forwarded_to_the_nidaqmx_task(self, cls_name, mock_system,
+                                                   mock_constants):
+        """The underlying nidaqmx.Task is created on the same transport."""
+        opts = MagicMock(name="grpc_options")
+        _, _, mock_cls = self._construct(cls_name, mock_system, mock_constants,
+                                         grpc_options=opts)
+        mock_cls.assert_called_once_with(new_task_name="dio", grpc_options=opts)
+
+    @pytest.mark.parametrize("cls_name", ["DITask", "DOTask"])
+    def test_options_stored_on_the_instance(self, cls_name, mock_system,
+                                            mock_constants):
+        """The transport is introspectable after construction."""
+        opts = MagicMock(name="grpc_options")
+        task, _, _ = self._construct(cls_name, mock_system, mock_constants,
+                                     grpc_options=opts)
+        assert task.grpc_options is opts
+
+    @pytest.mark.parametrize(
+        "cls_name,channel_attr",
+        [("DITask", "di_channels"), ("DOTask", "do_channels")],
+    )
+    def test_from_task_inherits_the_transport(self, cls_name, channel_attr,
+                                              mock_constants):
+        """Wrapping a remote nidaqmx task keeps its server."""
+        import nidaqwrapper.digital as dig_mod
+
+        opts = MagicMock(name="grpc_options")
+        raw = _make_external_digital_task(channel_attr)
+        raw._grpc_options = opts
+        with patch("nidaqwrapper.digital.constants", mock_constants):
+            wrapped = getattr(dig_mod, cls_name).from_task(raw)
+
+        assert wrapped.grpc_options is opts
+
+    def test_port_expansion_uses_the_task_transport(self, mock_system,
+                                                    mock_constants):
+        """A port-only spec is expanded against the remote device list."""
+        import nidaqwrapper.digital as dig_mod
+
+        opts = MagicMock(name="grpc_options")
+        task, _, _ = self._construct("DITask", mock_system, mock_constants,
+                                     grpc_options=opts)
+        with (
+            patch("nidaqwrapper.digital._expand_port_to_line_range",
+                  side_effect=lambda lines, *a: lines) as expand,
+            patch("nidaqwrapper.digital.constants", mock_constants),
+        ):
+            task.add_channel("switches", lines="Dev1/port0")
+
+        expand.assert_called_once_with("Dev1/port0", opts)

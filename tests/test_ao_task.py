@@ -160,7 +160,7 @@ class TestAOTaskConstructor:
             from nidaqwrapper.ao_task import AOTask
             AOTask("signal_gen", sample_rate=10000)
 
-        mock_cls.assert_called_once_with(new_task_name="signal_gen")
+        mock_cls.assert_called_once_with(new_task_name="signal_gen", grpc_options=None)
 
     def test_task_attribute_set_immediately(self, mock_system, mock_constants):
         """self.task is set to the nidaqmx.Task in the constructor."""
@@ -1500,7 +1500,7 @@ max_val = 10.0
             from nidaqwrapper.ao_task import AOTask
             task = AOTask.from_config(path)
 
-        mock_cls.assert_called_once_with(new_task_name="signal_gen")
+        mock_cls.assert_called_once_with(new_task_name="signal_gen", grpc_options=None)
         assert task.sample_rate == 10000
 
     def test_resolves_device_alias(self, mock_system, mock_constants, tmp_path):
@@ -2261,7 +2261,7 @@ class TestFromName:
             from nidaqwrapper.ao_task import AOTask
             task = AOTask.from_name("MaxAOTask")
 
-        mock_get.assert_called_once_with("MaxAOTask")
+        mock_get.assert_called_once_with("MaxAOTask", None)
         assert isinstance(task, AOTask)
         assert task.task is mock_ni_task
         assert task._owns_task is True
@@ -2508,3 +2508,58 @@ class TestConfigureClockSource:
             task.configure()
 
         assert task.clock_source is None
+
+
+class TestAOTaskGrpcOptions:
+    """AOTask can be built against a remote NI gRPC Device Server."""
+
+    def _construct(self, mock_system, mock_constants, **kwargs):
+        import nidaqwrapper.ao_task as ao_mod
+
+        system = mock_system(task_names=[])
+        with (
+            patch.object(ao_mod, "_resolve_system", return_value=system) as res,
+            patch("nidaqwrapper.ao_task.nidaqmx.task.Task",
+                  return_value=_make_mock_ni_task()) as mock_cls,
+            patch("nidaqwrapper.ao_task.constants", mock_constants),
+        ):
+            task = ao_mod.AOTask("signal_gen", sample_rate=25600, **kwargs)
+        return task, res, mock_cls
+
+    def test_default_uses_the_local_driver(self, mock_system, mock_constants):
+        """Without grpc_options the local system is resolved."""
+        _, res, _ = self._construct(mock_system, mock_constants)
+        res.assert_called_once_with(None)
+
+    def test_options_resolve_the_remote_system(self, mock_system, mock_constants):
+        """grpc_options are handed to the system resolver."""
+        opts = MagicMock(name="grpc_options")
+        _, res, _ = self._construct(mock_system, mock_constants,
+                                    grpc_options=opts)
+        res.assert_called_once_with(opts)
+
+    def test_options_forwarded_to_the_nidaqmx_task(self, mock_system, mock_constants):
+        """The underlying nidaqmx.Task is created on the same transport."""
+        opts = MagicMock(name="grpc_options")
+        _, _, mock_cls = self._construct(mock_system, mock_constants,
+                                         grpc_options=opts)
+        mock_cls.assert_called_once_with(
+            new_task_name="signal_gen", grpc_options=opts
+        )
+
+    def test_options_stored_on_the_instance(self, mock_system, mock_constants):
+        """The transport is introspectable after construction."""
+        opts = MagicMock(name="grpc_options")
+        task, _, _ = self._construct(mock_system, mock_constants,
+                                     grpc_options=opts)
+        assert task.grpc_options is opts
+
+    def test_from_task_inherits_the_transport(self, mock_constants):
+        """Wrapping a remote nidaqmx task keeps its server."""
+        from nidaqwrapper.ao_task import AOTask
+
+        opts = MagicMock(name="grpc_options")
+        raw = _make_external_ao_task(mock_constants)
+        raw._grpc_options = opts
+        with patch("nidaqwrapper.ao_task.constants", mock_constants):
+            assert AOTask.from_task(raw).grpc_options is opts

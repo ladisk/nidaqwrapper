@@ -36,9 +36,10 @@ except ImportError:
     _NIDAQMX_AVAILABLE = False
 
 from .base_task import _SAMPLE_MODE_ATTR, BaseTask
+from .utils import _resolve_system
 
 
-def _expand_port_to_line_range(lines: str) -> str:
+def _expand_port_to_line_range(lines: str, grpc_options: Any = None) -> str:
     """Expand a port-only spec to an explicit line range.
 
     ``CHAN_PER_LINE`` requires line-level specifications.  When the user
@@ -47,6 +48,13 @@ def _expand_port_to_line_range(lines: str) -> str:
     explicit line range string (e.g. ``'Dev1/port0/line0:7'``).
 
     If the spec already contains ``'/line'`` it is returned unchanged.
+    Parameters
+    ----------
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the query is served by the NI gRPC Device Server
+        described by these options instead of the local NI-DAQmx
+        driver.  Defaults to ``None`` (local driver).
+
     """
     if "/line" in lines:
         return lines
@@ -56,7 +64,7 @@ def _expand_port_to_line_range(lines: str) -> str:
     parts = lines.split("/")
     dev_name = parts[0]
 
-    system = nidaqmx.system.System.local()
+    system = _resolve_system(grpc_options)
     dev = system.devices[dev_name]
 
     # Find all DI lines belonging to this port
@@ -92,6 +100,13 @@ class DITask(BaseTask):
         Sample rate in Hz. If ``None`` (default), the task operates in
         on-demand mode (single-sample reads). If a float is provided,
         the task operates in clocked (continuous) mode.
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the task is created on the NI gRPC Device Server
+        described by these options rather than by a locally-installed
+        NI-DAQmx driver, and device discovery is served by the same
+        server.  ``session_name`` must be either ``""`` or equal to
+        *task_name*, a restriction imposed by nidaqmx itself.  Defaults
+        to ``None``, meaning the local driver.
 
     Raises
     ------
@@ -121,7 +136,14 @@ class DITask(BaseTask):
     _channel_attr = "di_channels"
     _channel_type_label = "DI"
 
-    def __init__(self, task_name: str, sample_rate: float | None = None) -> None:
+    def __init__(
+        self,
+        task_name: str,
+        sample_rate: float | None = None,
+        *,
+        grpc_options: Any = None,
+    ) -> None:
+        self.grpc_options = grpc_options
         self.task_name = task_name
         self.sample_rate = sample_rate
         self.mode: str = "on_demand" if sample_rate is None else "clocked"
@@ -133,7 +155,7 @@ class DITask(BaseTask):
         self.clock_source: str | None = None
 
         # Discover connected devices
-        system = nidaqmx.system.System.local()
+        system = _resolve_system(grpc_options)
         self.device_list: list[str] = [dev.name for dev in system.devices]
 
         # Check for duplicate task name in NI MAX before allocating a handle
@@ -145,7 +167,9 @@ class DITask(BaseTask):
             )
 
         # Create the nidaqmx task immediately — it is the single source of truth
-        self.task = nidaqmx.task.Task(new_task_name=task_name)
+        self.task = nidaqmx.task.Task(
+            new_task_name=task_name, grpc_options=grpc_options
+        )
 
         # Track ownership — False when task is externally provided
         self._owns_task: bool = True
@@ -188,7 +212,9 @@ class DITask(BaseTask):
             )
 
         # Expand port-only spec to explicit line range before duplicate check
-        expanded_lines = _expand_port_to_line_range(lines)
+        expanded_lines = _expand_port_to_line_range(
+            lines, self.grpc_options
+        )
 
         # Duplicate lines detection: iterate the live task channels
         for ch in self.task.di_channels:
@@ -430,7 +456,9 @@ class DITask(BaseTask):
         pathlib.Path(path).write_text("\n".join(lines), encoding="utf-8")
 
     @classmethod
-    def from_config(cls, path: str | pathlib.Path) -> DITask:
+    def from_config(
+        cls, path: str | pathlib.Path, grpc_options: Any = None
+    ) -> DITask:
         """Create a :class:`DITask` from a TOML configuration file.
 
         Reads the TOML file produced by :meth:`save_config`, constructs a new
@@ -440,6 +468,10 @@ class DITask(BaseTask):
         ----------
         path : str or pathlib.Path
             Path to a TOML file produced by :meth:`save_config`.
+        grpc_options : nidaqmx.GrpcSessionOptions, optional
+            Forwarded to the constructor, so the task is created on the NI
+            gRPC Device Server described by these options instead of by the
+            local NI-DAQmx driver.  Defaults to ``None`` (local driver).
 
         Returns
         -------
@@ -469,7 +501,11 @@ class DITask(BaseTask):
         task_section = data["task"]
         sample_rate = task_section.get("sample_rate", None)
 
-        task = cls(task_section["name"], sample_rate=sample_rate)
+        task = cls(
+            task_section["name"],
+            sample_rate=sample_rate,
+            grpc_options=grpc_options,
+        )
 
         for ch in data.get("channels", []):
             task.add_channel(channel_name=ch["name"], lines=ch["lines"])
@@ -490,6 +526,9 @@ class DITask(BaseTask):
         ----------
         task : nidaqmx.task.Task
             A pre-configured nidaqmx.Task with at least one DI channel.
+            The wrapper inherits the task's transport: a task built with
+            ``grpc_options`` keeps using the same NI gRPC Device Server
+            for later device queries.
         take_ownership : bool, optional
             If ``True``, the wrapper takes ownership of the task and all
             mutating methods (:meth:`add_channel`, :meth:`configure`,
@@ -544,6 +583,10 @@ class DITask(BaseTask):
         # Create instance without calling __init__ (bypass constructor checks)
         instance = object.__new__(cls)
 
+        # Inherit the wrapped task's transport so later device
+        # queries go to the same place the task itself does.
+        instance.grpc_options = getattr(task, "_grpc_options", None)
+
         # Populate attributes from the live task
         instance.task = task
         instance.task_name = task.name
@@ -594,6 +637,13 @@ class DOTask(BaseTask):
         Sample rate in Hz. If ``None`` (default), the task operates in
         on-demand mode (single-sample writes). If a float is provided,
         the task operates in clocked (continuous) mode.
+    grpc_options : nidaqmx.GrpcSessionOptions, optional
+        When given, the task is created on the NI gRPC Device Server
+        described by these options rather than by a locally-installed
+        NI-DAQmx driver, and device discovery is served by the same
+        server.  ``session_name`` must be either ``""`` or equal to
+        *task_name*, a restriction imposed by nidaqmx itself.  Defaults
+        to ``None``, meaning the local driver.
 
     Raises
     ------
@@ -623,12 +673,19 @@ class DOTask(BaseTask):
     _channel_attr = "do_channels"
     _channel_type_label = "DO"
 
-    def __init__(self, task_name: str, sample_rate: float | None = None) -> None:
+    def __init__(
+        self,
+        task_name: str,
+        sample_rate: float | None = None,
+        *,
+        grpc_options: Any = None,
+    ) -> None:
+        self.grpc_options = grpc_options
         self.task_name = task_name
         self.sample_rate = sample_rate
         self.mode: str = "on_demand" if sample_rate is None else "clocked"
 
-        system = nidaqmx.system.System.local()
+        system = _resolve_system(grpc_options)
         self.device_list: list[str] = [dev.name for dev in system.devices]
 
         existing_tasks = system.tasks.task_names
@@ -639,7 +696,9 @@ class DOTask(BaseTask):
             )
 
         # Create the nidaqmx task immediately — it is the single source of truth
-        self.task = nidaqmx.task.Task(new_task_name=task_name)
+        self.task = nidaqmx.task.Task(
+            new_task_name=task_name, grpc_options=grpc_options
+        )
 
         # Track ownership — False when task is externally provided
         self._owns_task: bool = True
@@ -682,7 +741,9 @@ class DOTask(BaseTask):
             )
 
         # Expand port-only spec to explicit line range before duplicate check
-        expanded_lines = _expand_port_to_line_range(lines)
+        expanded_lines = _expand_port_to_line_range(
+            lines, self.grpc_options
+        )
 
         # Duplicate lines detection: iterate the live task channels
         for ch in self.task.do_channels:
@@ -825,7 +886,9 @@ class DOTask(BaseTask):
         pathlib.Path(path).write_text("\n".join(lines), encoding="utf-8")
 
     @classmethod
-    def from_config(cls, path: str | pathlib.Path) -> DOTask:
+    def from_config(
+        cls, path: str | pathlib.Path, grpc_options: Any = None
+    ) -> DOTask:
         """Create a :class:`DOTask` from a TOML configuration file.
 
         Reads the TOML file produced by :meth:`save_config`, constructs a new
@@ -835,6 +898,10 @@ class DOTask(BaseTask):
         ----------
         path : str or pathlib.Path
             Path to a TOML file produced by :meth:`save_config`.
+        grpc_options : nidaqmx.GrpcSessionOptions, optional
+            Forwarded to the constructor, so the task is created on the NI
+            gRPC Device Server described by these options instead of by the
+            local NI-DAQmx driver.  Defaults to ``None`` (local driver).
 
         Returns
         -------
@@ -864,7 +931,11 @@ class DOTask(BaseTask):
         task_section = data["task"]
         sample_rate = task_section.get("sample_rate", None)
 
-        task = cls(task_section["name"], sample_rate=sample_rate)
+        task = cls(
+            task_section["name"],
+            sample_rate=sample_rate,
+            grpc_options=grpc_options,
+        )
 
         for ch in data.get("channels", []):
             task.add_channel(channel_name=ch["name"], lines=ch["lines"])
@@ -885,6 +956,9 @@ class DOTask(BaseTask):
         ----------
         task : nidaqmx.task.Task
             A pre-configured nidaqmx.Task with at least one DO channel.
+            The wrapper inherits the task's transport: a task built with
+            ``grpc_options`` keeps using the same NI gRPC Device Server
+            for later device queries.
         take_ownership : bool, optional
             If ``True``, the wrapper takes ownership of the task and all
             mutating methods (:meth:`add_channel`, :meth:`configure`,
@@ -938,6 +1012,10 @@ class DOTask(BaseTask):
 
         # Create instance without calling __init__
         instance = object.__new__(cls)
+
+        # Inherit the wrapped task's transport so later device
+        # queries go to the same place the task itself does.
+        instance.grpc_options = getattr(task, "_grpc_options", None)
 
         # Populate attributes from the live task
         instance.task = task
