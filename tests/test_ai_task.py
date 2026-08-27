@@ -1362,6 +1362,59 @@ class TestAcquireBase:
         assert isinstance(result, np.ndarray)
         assert result.size == 0
 
+    def test_empty_buffer_over_grpc(self, mock_system, mock_constants):
+        """-52005 on a READ_ALL_AVAILABLE read is treated as an empty buffer.
+
+        The NI gRPC Device Server raises DaqError -52005 where a local driver
+        returns an empty list, so acquire() must produce the same empty array
+        for both transports.
+        """
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            pass
+        mt.read.side_effect = DaqError("parameter not valid", -52005)
+
+        result = task.acquire()
+
+        assert isinstance(result, np.ndarray)
+        assert result.size == 0
+        # Same shape a local empty read produces.
+        assert result.shape == np.array([]).reshape(-1, 1).shape
+
+    def test_grpc_empty_error_propagates_for_explicit_count(
+        self, mock_system, mock_constants
+    ):
+        """-52005 still raises when a sample count was requested.
+
+        Only READ_ALL_AVAILABLE can legitimately find nothing to read; asking
+        for n samples and getting -52005 is a real error.
+        """
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            pass
+        mt.read.side_effect = DaqError("parameter not valid", -52005)
+
+        with pytest.raises(DaqError) as exc_info:
+            task.acquire(100)
+        assert exc_info.value.error_code == -52005
+
+    def test_other_daq_errors_still_propagate(self, mock_system, mock_constants):
+        """Any error code other than -52005 propagates unchanged."""
+        from nidaqmx.errors import DaqError
+
+        ctx, task, mt = _build(mock_system, mock_constants)
+        with ctx:
+            pass
+        mt.read.side_effect = DaqError("device identifier is invalid", -200220)
+
+        with pytest.raises(DaqError) as exc_info:
+            task.acquire()
+        assert exc_info.value.error_code == -200220
+
     def test_calls_acquire(self, mock_system, mock_constants):
         """task.read() is called with number_of_samples_per_channel=-1."""
         ctx, task, mt = _build(mock_system, mock_constants)

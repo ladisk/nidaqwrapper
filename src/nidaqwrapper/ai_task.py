@@ -602,7 +602,17 @@ class AITask(BaseTask):
             shape.
         """
         count = -1 if n_samples is None else n_samples
-        raw = self.task.read(number_of_samples_per_channel=count)
+        try:
+            raw = self.task.read(number_of_samples_per_channel=count)
+        except DaqError as exc:
+            # READ_ALL_AVAILABLE on an empty buffer: a local NI-DAQmx driver
+            # returns an empty list, but the NI gRPC Device Server raises
+            # -52005 instead.  Normalise to the local behaviour so both
+            # transports return the same empty array.
+            if n_samples is None and exc.error_code == -52005:
+                raw = []
+            else:
+                raise
         data = np.array(raw)
 
         if data.ndim == 1:
